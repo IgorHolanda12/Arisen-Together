@@ -1,0 +1,1816 @@
+#include <windows.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "game.h"
+#include "mod.h"
+
+namespace {
+volatile LONG g_rebuild_who = -2;
+std::vector<uint32_t> g_snaps[3];
+std::vector<uint32_t> g_snap_objs;
+
+struct Goto {
+    bool active;
+    float x, z, radius;
+    DWORD until;
+    float offset_deg;
+    int attempt;
+    DWORD check_at, hold_until;
+    float last_x, last_z;
+};
+const float kTryOffsets[] = {60, -60, 120, -120, 170, 30, -30, 90, -90};
+Goto g_goto = {};
+void goto_start(float x, float z, float r, unsigned timeout, bool world)
+{
+    field_origin_scan();
+    float p[3] = {x, 0.f, z};
+    if (!world)
+        field_to_world(p);
+    g_goto = {true, p[0], p[2], r, GetTickCount() + timeout, 0, 0, GetTickCount() + 600, 0, 0, 0};
+}
+long g_lines_done = 0;
+char g_queue[256][128];
+int g_qhead = 0, g_qtail = 0;
+DWORD g_busy_until = 0;
+char g_current[128] = "idle";
+uintptr_t g_poke_addr = 0;
+uint32_t g_poke_val = 0;
+DWORD g_poke_until = 0;
+bool g_arisen_inv = false;
+
+void keep_arisen_inv()
+{
+    if (!g_arisen_inv)
+        return;
+    uintptr_t a = possess_arisen();
+    if (float *hp = a ? enemies_hp(a) : nullptr)
+        game::at<uint8_t>(reinterpret_cast<uintptr_t>(hp) - 8, 0x30) |= 1;
+}
+
+bool camera_forward(float &fx, float &fz)
+{
+    uintptr_t holder = game::at<uintptr_t>(0, game::va(0x018D0B6C));
+    if (!holder)
+        return false;
+    uintptr_t cam = game::at<uintptr_t>(holder, 0x34);
+    if (!cam)
+        return false;
+    fx = game::at<float>(cam, 0x60) - game::at<float>(cam, 0x40);
+    fz = game::at<float>(cam, 0x68) - game::at<float>(cam, 0x48);
+    float n = std::sqrt(fx * fx + fz * fz);
+    if (n < 1e-3f)
+        return false;
+    fx /= n;
+    fz /= n;
+    return true;
+}
+
+bool position(uintptr_t ch, float &x, float &z)
+{
+    if (!ch)
+        return false;
+    x = game::at<float>(ch, 0x40);
+    z = game::at<float>(ch, 0x48);
+    return true;
+}
+
+void run_line(const char *line)
+{
+    unsigned slot, buttons, ms;
+    int lx, ly, rx, ry, lt, rt;
+    float x, z, r;
+    unsigned timeout;
+    if (sscanf(line, "pad %u %x %d %d %d %d %d %d %u", &slot, &buttons, &lx, &ly, &rx, &ry, &lt, &rt, &ms) == 9 &&
+        slot < 4) {
+        XINPUT_GAMEPAD g = {};
+        g.wButtons = WORD(buttons);
+        g.sThumbLX = SHORT(lx);
+        g.sThumbLY = SHORT(ly);
+        g.sThumbRX = SHORT(rx);
+        g.sThumbRY = SHORT(ry);
+        g.bLeftTrigger = BYTE(lt);
+        g.bRightTrigger = BYTE(rt);
+        pads_override(slot, g, GetTickCount() + ms);
+        g_busy_until = GetTickCount() + ms + 100;
+        _snprintf(g_current, sizeof g_current, "pad %u %04X for %u ms", slot, buttons, ms);
+    } else if (strncmp(line, "wwatch", 6) == 0) {
+        for (uintptr_t g = game::va(0x01621000); g < game::va(0x019AB1E0); g += 4) {
+            uintptr_t q = game::at<uintptr_t>(g, 0);
+            if (q < 0x10000 || q >= 0x7FFF0000 || (q & 3) || !mem_readable(reinterpret_cast<void *>(q), 0x120))
+                continue;
+            if (strcmp(enemies_class_of(q), "uWaterReflectionMap") == 0) {
+                logf("bridge: wwatch [%08X] = %08X, +0x110 = %.0f", unsigned(g), unsigned(q), game::at<float>(q, 0x110));
+                watch_start(q + 0x110, 6, 0);
+                break;
+            }
+        }
+        strcpy(g_current, "wwatch");
+    } else if (strncmp(line, "gfind", 5) == 0) {
+        int hits = 0;
+        for (uintptr_t g = game::va(0x01621000); g < game::va(0x019AB1E0) && hits < 60; g += 4) {
+            uintptr_t q = game::at<uintptr_t>(g, 0);
+            if (q < 0x10000 || q >= 0x7FFF0000 || (q & 3) || !mem_readable(reinterpret_cast<void *>(q), 0x400))
+                continue;
+            for (size_t o = 0; o + 12 <= 0x400; o += 4) {
+                float fx = game::at<float>(q, o), fz = game::at<float>(q, o + 8);
+                auto cell = [](float v) { return v == v && v != 0.f && std::fabs(v) < 1e7f && std::fmod(v, 10000.f) == 0.f; };
+                if (cell(fx) && cell(fz) && std::fabs(fx) >= 10000.f && std::fabs(fz) >= 10000.f) {
+                    logf("bridge: gfind [%08X]=%08X (%s) +0x%X: %.0f %.0f", unsigned(g), unsigned(q), enemies_class_of(q), unsigned(o), fx, fz);
+                    ++hits;
+                }
+            }
+        }
+        logf("bridge: gfind done (%d)", hits);
+        strcpy(g_current, "gfind");
+    } else if (strncmp(line, "ffind", 5) == 0) {
+        auto scan = [](const char *what, uintptr_t base, size_t size) {
+            int hits = 0;
+            for (size_t o = 0; o + 12 <= size && hits < 12; o += 4) {
+                if (!mem_readable(reinterpret_cast<void *>(base + o), 12))
+                    break;
+                float fx = game::at<float>(base, o), fz = game::at<float>(base, o + 8);
+                auto cell = [](float v) { return v == v && v != 0.f && std::fabs(v) < 1e7f && std::fmod(v, 10000.f) == 0.f; };
+                if (cell(fx) && cell(fz)) {
+                    logf("bridge: ffind %s %08X+0x%X: %.0f %.0f", what, unsigned(base), unsigned(o), fx, fz);
+                    ++hits;
+                }
+            }
+        };
+        uintptr_t st = current_stage_area(), gm = game::at<uintptr_t>(game::kGameMain, 0);
+        if (st && mem_readable(reinterpret_cast<void *>(st), 4)) {
+            scan("aStage", st, 0x8000);
+            for (size_t o = 0; o < 0x400; o += 4) {
+                uintptr_t q = game::at<uintptr_t>(st, o);
+                if (q > 0x10000 && q < 0x7FFF0000 && !(q & 3) && mem_readable(reinterpret_cast<void *>(q), 0x10)) {
+                    char what[32];
+                    _snprintf(what, sizeof what, "aStage+%X->", unsigned(o));
+                    scan(what, q, 0x2000);
+                }
+            }
+        }
+        if (gm)
+            scan("sMain", gm, 0x10000);
+        logf("bridge: ffind done (aStage %08X, sMain %08X)", unsigned(st), unsigned(gm));
+        strcpy(g_current, "ffind");
+    } else if (sscanf(line, "wgoto %f %f %f %u", &x, &z, &r, &timeout) == 4) {
+        goto_start(x, z, r, timeout, true);
+        _snprintf(g_current, sizeof g_current, "wgoto %.0f %.0f", x, z);
+    } else if (sscanf(line, "goto %f %f %f %u", &x, &z, &r, &timeout) == 4) {
+        goto_start(x, z, r, timeout, false);
+        _snprintf(g_current, sizeof g_current, "goto %.0f %.0f", x, z);
+    } else if (sscanf(line, "egoto #%u %f %u", &slot, &r, &timeout) == 3) {
+        char cls[24] = {};
+        sscanf(line, "egoto #%*u %*f %*u %23s", cls);
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128);
+        for (int k = 0; k < n; ++k)
+            if (unsigned(list[k].index) == slot && (!cls[0] || strcmp(list[k].name, cls) == 0)) {
+                x = game::at<float>(list[k].ptr, 0x40);
+                z = game::at<float>(list[k].ptr, 0x48);
+                goto_start(x, z, r, timeout, false);
+                logf("bridge: egoto #%u %s at (%.0f, %.0f)", slot, list[k].name, x, z);
+            }
+        _snprintf(g_current, sizeof g_current, "egoto #%u", slot);
+    } else if (sscanf(line, "pawngoto %u %f %u", &slot, &r, &timeout) == 3) {
+        if (uintptr_t ch = possess_pawn_ptr(int(slot))) {
+            x = game::at<float>(ch, 0x40);
+            z = game::at<float>(ch, 0x48);
+            goto_start(x, z, r, timeout, false);
+            logf("bridge: pawngoto %u at (%.0f, %.0f)", slot, x, z);
+        }
+        _snprintf(g_current, sizeof g_current, "pawngoto %u", slot);
+    } else if (sscanf(line, "enear %f %u", &r, &timeout) == 2) {
+        float max_d = 1000;
+        sscanf(line, "enear %*f %*u %f", &max_d);
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128), best = -1;
+        uintptr_t me = possess_arisen();
+        float bd = max_d * max_d;
+        for (int k = 0; me && k < n; ++k) {
+            float *hp = list[k].died ? nullptr : enemies_hp(list[k].ptr);
+            if (!hp || hp[0] <= 0)
+                continue;
+            float dx = game::at<float>(list[k].ptr, 0x40) - game::at<float>(me, 0x40);
+            float dz = game::at<float>(list[k].ptr, 0x48) - game::at<float>(me, 0x48);
+            if (dx * dx + dz * dz < bd) {
+                bd = dx * dx + dz * dz;
+                best = k;
+            }
+        }
+        if (best >= 0) {
+            x = game::at<float>(list[best].ptr, 0x40);
+            z = game::at<float>(list[best].ptr, 0x48);
+            goto_start(x, z, r, timeout, false);
+            logf("bridge: enear #%d %s at (%.0f, %.0f)", list[best].index, list[best].name, x, z);
+        }
+        _snprintf(g_current, sizeof g_current, "enear");
+    } else if (strncmp(line, "watch ", 6) == 0) {
+        char who[16] = {};
+        unsigned off = 0, count = 20;
+        if (sscanf(line + 6, "%15s %x %u", who, &off, &count) >= 2) {
+            uintptr_t holder = game::at<uintptr_t>(0, game::va(0x018D0B6C));
+            uintptr_t ch = strcmp(who, "pawn") == 0     ? possess_main_pawn()
+                           : strcmp(who, "camera") == 0 ? (holder ? game::at<uintptr_t>(holder, 0x34) : 0)
+                                                         : possess_arisen();
+            if (!ch && strcmp(who, "arisen") == 0)
+                if (uintptr_t party = game::at<uintptr_t>(game::va(0x018FA4EC), 0))
+                    ch = game::at<uintptr_t>(party, 0x99C);
+            if (ch)
+                watch_start(ch + off, long(count), strcmp(who, "camera") == 0 ? 0 : ch);
+        }
+        _snprintf(g_current, sizeof g_current, "watch %s +%X", who, off);
+    } else if (strncmp(line, "watchp ", 7) == 0) {
+        char who[16] = {};
+        unsigned poff = 0, off = 0, count = 20;
+        if (sscanf(line + 7, "%15s %x %x %u", who, &poff, &off, &count) >= 3) {
+            uintptr_t ch = strcmp(who, "pawn") == 0 ? possess_main_pawn() : possess_arisen();
+            uintptr_t p = ch ? game::at<uintptr_t>(ch, poff) : 0;
+            logf("bridge: watchp %s [+%X] = %p, field +%X = %.2f", who, poff, (void *)p, off,
+                 p ? game::at<float>(p, off) : 0.f);
+            if (p)
+                watch_start(p + off, long(count), 0, true);
+        }
+        _snprintf(g_current, sizeof g_current, "watchp %s +%X +%X", who, poff, off);
+    } else if (strncmp(line, "uscan ", 6) == 0) {
+        char who[16] = {};
+        unsigned v = 0;
+        uintptr_t obj = 0;
+        if (sscanf(line + 6, "%15s %u", who, &v) == 2)
+            obj = strcmp(who, "pawn") == 0 ? possess_main_pawn() : possess_arisen();
+        int hits = 0;
+        auto ok = [](uintptr_t p) { return p >= 0x10000 && !(p & 3) && mem_readable((void *)p, 0x1000); };
+        for (uintptr_t o = 0; obj && o < 0x7000 && hits < 40 && mem_readable((void *)(obj + o), 4); o += 4) {
+            if (game::at<uint32_t>(obj, o) == v && ++hits)
+                logf("bridge: uscan %s +0x%X (%p)", who, unsigned(o), (void *)(obj + o));
+            uintptr_t p = game::at<uintptr_t>(obj, o);
+            if (!ok(p))
+                continue;
+            for (uintptr_t q = 0; q < 0x1000 && hits < 40; q += 4) {
+                if (game::at<uint32_t>(p, q) == v && ++hits)
+                    logf("bridge: uscan %s [+0x%X]+0x%X (%p)", who, unsigned(o), unsigned(q), (void *)(p + q));
+                uintptr_t r = game::at<uintptr_t>(p, q);
+                if (r == obj || !ok(r))
+                    continue;
+                for (uintptr_t w = 0; w < 0x1000 && hits < 40; w += 4)
+                    if (game::at<uint32_t>(r, w) == v && ++hits)
+                        logf("bridge: uscan %s [[+0x%X]+0x%X]+0x%X (%p)", who, unsigned(o), unsigned(q), unsigned(w),
+                             (void *)(r + w));
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "uscan %s (%d hits)", who, hits);
+    } else if (strncmp(line, "dumpa ", 6) == 0) {
+        unsigned addr = 0, size = 0;
+        char name[32] = {};
+        if (sscanf(line + 6, "%x %x %31s", &addr, &size, name) == 3 && size <= 0x400000) {
+            std::vector<uint8_t> data(size);
+            SIZE_T got = 0;
+            if (ReadProcessMemory(GetCurrentProcess(), (void *)uintptr_t(addr), data.data(), size, &got) && got == size) {
+                char path[64];
+                _snprintf(path, sizeof path, "dumpa_%s.bin", name);
+                if (FILE *f = fopen(path, "wb")) {
+                    fwrite(data.data(), 1, size, f);
+                    fclose(f);
+                }
+                logf("bridge: dumpa %08X %X bytes as %s", addr, size, path);
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "dumpa");
+    } else if (strncmp(line, "vmark ", 6) == 0 || strncmp(line, "vnew ", 5) == 0) {
+        static std::vector<uintptr_t> marked;
+        bool mark = line[1] == 'm';
+        unsigned v = 0, near_v = 0;
+        int args = sscanf(line + (mark ? 6 : 5), "%u %u", &v, &near_v);
+        std::vector<uintptr_t> now;
+        static std::vector<uint8_t> page(0x1000);
+        MEMORY_BASIC_INFORMATION mbi;
+        for (uintptr_t p = 0x10000; args >= 1 && p < 0x7FFF0000 && now.size() < 20000 && VirtualQuery((void *)p, &mbi, sizeof mbi);
+             p = uintptr_t(mbi.BaseAddress) + mbi.RegionSize) {
+            if (mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mbi.Protect & PAGE_GUARD))
+                continue;
+            for (uintptr_t q = uintptr_t(mbi.BaseAddress); q < uintptr_t(mbi.BaseAddress) + mbi.RegionSize; q += 0x1000) {
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), (void *)q, page.data(), 0x1000, &got) || got != 0x1000)
+                    continue;
+                for (int o = 0; o < 0x1000; o += 4)
+                    if (*(const uint32_t *)(page.data() + o) == v)
+                        now.push_back(q + o);
+            }
+        }
+        if (mark) {
+            marked = now;
+            logf("bridge: vmark %u: %u places", v, unsigned(now.size()));
+        } else {
+            int shown = 0;
+            for (uintptr_t a : now) {
+                if (std::find(marked.begin(), marked.end(), a) != marked.end() || shown >= 25)
+                    continue;
+                ++shown;
+                long best = 0x7FFFFFFF;
+                std::vector<uint8_t> around(0x4000);
+                SIZE_T got = 0;
+                uintptr_t from = (a - 0x2000) & ~uintptr_t(3);
+                if (args == 2 && ReadProcessMemory(GetCurrentProcess(), (void *)from, around.data(), around.size(), &got) && got == around.size())
+                    for (size_t o = 0; o < around.size(); o += 4)
+                        if (*(const uint32_t *)(around.data() + o) == near_v && std::labs(long(from + o) - long(a)) < std::labs(best))
+                            best = long(from + o) - long(a);
+                logf("bridge: vnew %u at %08X%s", v, unsigned(a),
+                     best != 0x7FFFFFFF ? (std::string(", ") + std::to_string(near_v) + " at " + std::to_string(best)).c_str() : "");
+            }
+            logf("bridge: vnew %u: %u now, %u new shown", v, unsigned(now.size()), unsigned(shown));
+        }
+        _snprintf(g_current, sizeof g_current, "vmark/vnew");
+    } else if (strncmp(line, "vfind ", 6) == 0) {
+        unsigned v = 0;
+        int hits = 0;
+        size_t regions = 0, mb = 0;
+        if (sscanf(line + 6, "%u", &v) == 1) {
+            static std::vector<uint8_t> page(0x1000);
+            MEMORY_BASIC_INFORMATION mbi;
+            for (uintptr_t p = 0x10000; p < 0x7FFF0000 && hits < 30 && VirtualQuery((void *)p, &mbi, sizeof mbi);
+                 p = uintptr_t(mbi.BaseAddress) + mbi.RegionSize) {
+                if (mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mbi.Protect & PAGE_GUARD))
+                    continue;
+                ++regions;
+                mb += mbi.RegionSize;
+                for (uintptr_t q = uintptr_t(mbi.BaseAddress); q < uintptr_t(mbi.BaseAddress) + mbi.RegionSize && hits < 30; q += 0x1000) {
+                    SIZE_T got = 0;
+                    if (!ReadProcessMemory(GetCurrentProcess(), (void *)q, page.data(), 0x1000, &got) || got != 0x1000)
+                        continue;
+                    for (int o = 0; o < 0x1000 && hits < 30; o += 4)
+                        if (*(const uint32_t *)(page.data() + o) == v) {
+                            logf("bridge: vfind %u at %08X", v, unsigned(q + o));
+                            ++hits;
+                        }
+                }
+            }
+        }
+        logf("bridge: vfind %u: %d hits in %u regions, %u MB", v, hits, unsigned(regions), unsigned(mb >> 20));
+        _snprintf(g_current, sizeof g_current, "vfind (%d hits)", hits);
+    } else if (strncmp(line, "gscan ", 6) == 0) {
+        unsigned a = 0, b = 0;
+        int hits = 0;
+        if (sscanf(line + 6, "%u %u", &a, &b) == 2) {
+            static std::vector<uint8_t> obj(0x200000);
+            for (uintptr_t g = 0x018FA400; g < 0x018FA600 && hits < 20; g += 4) {
+                uintptr_t base = 0;
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), (void *)g, &base, 4, &got) || base < 0x10000 || (base & 3))
+                    continue;
+                size_t len = 0;
+                for (; len < obj.size(); len += 0x1000)
+                    if (!ReadProcessMemory(GetCurrentProcess(), (void *)(base + len), obj.data() + len, 0x1000, &got) || got != 0x1000)
+                        break;
+                for (size_t o = 0; o + 4 <= len && hits < 20; o += 4) {
+                    if (*(const uint32_t *)(obj.data() + o) != a)
+                        continue;
+                    for (size_t d = 4; d <= 4096 && o + d + 4 <= len; d += 4)
+                        if (*(const uint32_t *)(obj.data() + o + d) == b) {
+                            logf("bridge: gscan [%08X] = %08X: +0x%X, then +0x%X", unsigned(g), unsigned(base), unsigned(o), unsigned(d));
+                            ++hits;
+                            break;
+                        }
+                }
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "gscan (%d hits)", hits);
+    } else if (strncmp(line, "iscan ", 6) == 0) {
+        int n1 = 0, i1 = 0, n2 = 0, i2 = 0, hits = 0;
+        if (sscanf(line + 6, "%d %d %d %d", &n1, &i1, &n2, &i2) == 4) {
+            uint32_t a = uint16_t(n1) | uint32_t(uint16_t(i1)) << 16, b = uint16_t(n2) | uint32_t(uint16_t(i2)) << 16;
+            static std::vector<uint8_t> buf(0x100000);
+            uintptr_t found[20];
+            size_t regions = 0, bytes = 0, failed = 0;
+            MEMORY_BASIC_INFORMATION mbi;
+            for (uintptr_t p = 0x10000; p < 0x7FFF0000 && hits < 20 && VirtualQuery((void *)p, &mbi, sizeof mbi);
+                 p = uintptr_t(mbi.BaseAddress) + mbi.RegionSize) {
+                if (mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (mbi.Protect & PAGE_GUARD))
+                    continue;
+                const uint8_t *base = (const uint8_t *)mbi.BaseAddress;
+                ++regions;
+                bytes += mbi.RegionSize;
+                for (size_t o = 0; o + 80 <= mbi.RegionSize && hits < 20; o += 2) {
+                    if (*(const uint32_t *)(base + o) != a)
+                        continue;
+                    for (int s = 8; s <= 64; s += 2)
+                        if (*(const uint32_t *)(base + o + s) == b && hits < 20) {
+                            found[hits++] = uintptr_t(base + o);
+                            uint8_t row[80];
+                            SIZE_T got = 0;
+                            char hex[200] = "";
+                            int hl = 0;
+                            if (ReadProcessMemory(GetCurrentProcess(), base + o, row, sizeof row, &got) && got == sizeof row)
+                                for (int k = 0; k < 80; ++k)
+                                    hl += _snprintf(hex + hl, sizeof hex - hl, "%02X", row[k]);
+                            logf("bridge: iscan %d %d at %p stride %d: %s", n1, i1, (void *)(base + o), s, hex);
+                        }
+                }
+            }
+            logf("bridge: iscan read %u chunks, %u MB, %u failed", unsigned(regions), unsigned(bytes >> 20), unsigned(failed));
+            uint32_t page[1024];
+            int g = 0;
+            for (uintptr_t pg = 0x018C0000; pg < 0x01A00000 && g < 16 && hits; pg += 0x1000) {
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), (void *)pg, page, sizeof page, &got) || got != sizeof page)
+                    continue;
+                for (int k = 0; k < 1024 && g < 16; ++k)
+                    for (int h = 0; h < hits; ++h)
+                        if (page[k] <= found[h] && found[h] - page[k] < 0x100000 && page[k] > 0x10000 && !(page[k] & 3)) {
+                            logf("bridge: iscan   [%08X] = %08X, +0x%X before hit %d", unsigned(pg + 4 * k), page[k],
+                                 unsigned(found[h] - page[k]), h);
+                            ++g;
+                        }
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "iscan (%d hits)", hits);
+    } else if (strncmp(line, "watchpa ", 8) == 0) {
+        char who[16] = {};
+        unsigned poff = 0, off = 0, count = 20;
+        if (sscanf(line + 8, "%15s %x %x %u", who, &poff, &off, &count) >= 3) {
+            uintptr_t ch = strcmp(who, "pawn") == 0 ? possess_main_pawn() : possess_arisen();
+            uintptr_t p = ch ? game::at<uintptr_t>(ch, poff) : 0;
+            logf("bridge: watchpa %s [+%X] = %p, field +%X = %u", who, poff, (void *)p, off, p ? game::at<uint32_t>(p, off) : 0);
+            if (p)
+                watch_start(p + off, long(count), 0);
+        }
+        _snprintf(g_current, sizeof g_current, "watchpa %s +%X +%X", who, poff, off);
+    } else if (strncmp(line, "act ", 4) == 0) {
+        unsigned who = 0, number = 0;
+        if (sscanf(line + 4, "%u %x", &who, &number) == 2)
+            action_queue(int(who), int(number));
+        _snprintf(g_current, sizeof g_current, "act %u %X", who, number);
+    } else if (strncmp(line, "actc ", 5) == 0) {
+        unsigned who = 0;
+        char cls[64] = {};
+        int found = -1;
+        if (sscanf(line + 5, "%u %63s", &who, cls) == 2)
+            for (int n = 0; n <= 0x201 && found < 0; ++n)
+                if (strcmp(action_class(n), cls) == 0)
+                    found = n;
+        logf("bridge: actc %u %s = number 0x%X", who, cls, unsigned(found));
+        if (found >= 0)
+            action_queue(int(who), found);
+        _snprintf(g_current, sizeof g_current, "actc %u %s", who, cls);
+    } else if (strncmp(line, "liftme ", 7) == 0) {
+        float dy = 0.f;
+        uintptr_t a = possess_arisen();
+        if (sscanf(line + 7, "%f", &dy) == 1 && a) {
+            for (uintptr_t off : {uintptr_t(0x40), uintptr_t(0xE70), uintptr_t(0xE80), uintptr_t(0x1990)})
+                game::at<float>(a, off + 4) += dy;
+            logf("bridge: liftme %.0f: the Arisen at height %.0f", dy, game::at<float>(a, 0x44));
+        }
+        _snprintf(g_current, sizeof g_current, "liftme %.0f", dy);
+    } else if (strncmp(line, "warp ", 5) == 0) {
+        float dx = 0.f, dz = 0.f, dy = 0.f;
+        uintptr_t a = possess_arisen();
+        if (sscanf(line + 5, "%f %f %f", &dx, &dz, &dy) == 3 && a) {
+            for (uintptr_t off : {uintptr_t(0x40), uintptr_t(0xE70), uintptr_t(0xE80), uintptr_t(0x1990)}) {
+                game::at<float>(a, off) += dx;
+                game::at<float>(a, off + 4) += dy;
+                game::at<float>(a, off + 8) += dz;
+            }
+            logf("bridge: warp: the Arisen at (%.0f, %.0f, %.0f)", game::at<float>(a, 0x40), game::at<float>(a, 0x44),
+                 game::at<float>(a, 0x48));
+        }
+        _snprintf(g_current, sizeof g_current, "warp %.0f %.0f %.0f", dx, dz, dy);
+    } else if (strncmp(line, "warpat ", 7) == 0) {
+        float to[3] = {};
+        uintptr_t a = possess_arisen();
+        if (sscanf(line + 7, "%f %f %f", &to[0], &to[1], &to[2]) == 3 && a) {
+            for (uintptr_t off : {uintptr_t(0x40), uintptr_t(0xE70), uintptr_t(0xE80), uintptr_t(0x1990)})
+                memcpy(reinterpret_cast<void *>(a + off), to, sizeof to);
+            logf("bridge: warpat: the Arisen at (%.0f, %.0f, %.0f)", to[0], to[1], to[2]);
+        }
+        _snprintf(g_current, sizeof g_current, "warpat %.0f %.0f %.0f", to[0], to[1], to[2]);
+    } else if (strncmp(line, "warpw ", 6) == 0) {
+        float to[3] = {}, ox = 0.f, oz = 0.f, lx = 0.f, lz = 0.f;
+        uintptr_t a = possess_arisen();
+        bool learned = enemies_world_origin(lx, lz), game = false;
+        uintptr_t org = game::at<uintptr_t>(0x018FA528, 0);
+        if (org && mem_readable(reinterpret_cast<void *>(org + 0x20), 0x40) && game::at<uint8_t>(org, 0x20) == 1) {
+            ox = -game::at<float>(org, 0x50), oz = -game::at<float>(org, 0x58);
+            game = true;
+        } else if (learned) {
+            ox = lx, oz = lz;
+        }
+        if (sscanf(line + 6, "%f %f %f", &to[0], &to[1], &to[2]) == 3 && a && (game || learned)) {
+            to[0] -= ox, to[2] -= oz;
+            for (uintptr_t off : {uintptr_t(0x40), uintptr_t(0xE70), uintptr_t(0xE80), uintptr_t(0x1990)})
+                memcpy(reinterpret_cast<void *>(a + off), to, sizeof to);
+            logf("bridge: warpw: the Arisen at local (%.0f, %.0f, %.0f), origin (%.0f, %.0f) from %s (learned: %s %.0f, %.0f)",
+                 to[0], to[1], to[2], ox, oz, game ? "the game" : "the monsters", learned ? "" : "none,", lx, lz);
+        } else {
+            logf("bridge: warpw: not done (%s)", !a ? "no Arisen" : !(game || learned) ? "origin not known yet" : "bad arguments");
+        }
+        _snprintf(g_current, sizeof g_current, "warpw");
+    } else if (strncmp(line, "origin", 6) == 0) {
+        float ox = 0.f, oz = 0.f;
+        bool known = enemies_world_origin(ox, oz);
+        float ax = 0.f, az = 0.f;
+        bool a = position(possess_arisen(), ax, az);
+        uintptr_t org = game::at<uintptr_t>(0x018FA528, 0);
+        bool gok = org && mem_readable(reinterpret_cast<void *>(org + 0x20), 0x40);
+        logf("bridge: origin %s (%.0f, %.0f); Arisen local (%.0f, %.0f) = world (%.0f, %.0f); the game's: flag %u, -(%.0f, %.0f)",
+             known ? "known" : "not known", ox, oz, ax, az, a ? ax + ox : 0.f, a ? az + oz : 0.f, gok ? game::at<uint8_t>(org, 0x20) : 0xFF,
+             gok ? -game::at<float>(org, 0x50) : 0.f, gok ? -game::at<float>(org, 0x58) : 0.f);
+        strcpy(g_current, "origin");
+    } else if (strncmp(line, "stagejump ", 10) == 0) {
+        int st = 0, pt = 0;
+        bool ok = sscanf(line + 10, "%d %d", &st, &pt) == 2 && net_stage_jump(st, pt);
+        logf("bridge: stagejump %d %d: %s", st, pt, ok ? "requested" : "refused (not in a stage, or not a plain stage)");
+        _snprintf(g_current, sizeof g_current, "stagejump %d %d", st, pt);
+    } else if (strncmp(line, "fakehold ", 9) == 0) {
+        int s = -1, ms = 0;
+        if (sscanf(line + 9, "%d %d", &s, &ms) == 2) {
+            net_test_fake_hold(s, ms);
+            logf("bridge: fakehold: the Arisen's state says it holds player %d for %d ms", s, ms);
+        }
+        _snprintf(g_current, sizeof g_current, "fakehold %d %d", s, ms);
+    } else if (sscanf(line, "grabtest %u", &slot) == 1) {
+        action_queue_grab(int(slot));
+        _snprintf(g_current, sizeof g_current, "grabtest %u", slot);
+    } else if (sscanf(line, "flags273c %u", &slot) == 1) {
+        uintptr_t ch = slot == 0 ? possess_arisen() : possess_pawn_ptr(int(slot) - 1);
+        if (ch)
+            logf("bridge: flags273c %u: +0x273C %08X +0x2740 %08X +0x31EA %u action %s at %.0f %.0f", slot, game::at<uint32_t>(ch, 0x273C),
+                 game::at<uint32_t>(ch, 0x2740), game::at<uint8_t>(ch, 0x31EA), action_name(ch), game::at<float>(ch, 0x40),
+                 game::at<float>(ch, 0x48));
+        _snprintf(g_current, sizeof g_current, "flags273c %u", slot);
+    } else if (strncmp(line, "pcopy ", 6) == 0) {
+        int to = -2, from = -2;
+        unsigned off = 0, len = 0;
+        if (sscanf(line + 6, "%d %d %x %x", &to, &from, &off, &len) == 4 && to >= -1 && to < kPawns && from >= -1 &&
+            from < kPawns && off + len <= 0x800) {
+            uintptr_t a = to < 0 ? possess_arisen() : possess_pawn_ptr(to), b = from < 0 ? possess_arisen() : possess_pawn_ptr(from);
+            uintptr_t pa = a ? game::at<uintptr_t>(a, 0x3DEC) : 0, pb = b ? game::at<uintptr_t>(b, 0x3DEC) : 0;
+            if (pa && pb && mem_readable(reinterpret_cast<void *>(pa + off), len) && mem_readable(reinterpret_cast<void *>(pb + off), len)) {
+                memcpy(reinterpret_cast<void *>(pa + off), reinterpret_cast<void *>(pb + off), len);
+                logf("bridge: pcopy %d <- %d +%X %X bytes", to, from, off, len);
+            }
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "lookfrom ", 9) == 0) {
+        int from = -1;
+        unsigned off = 0, len = 0;
+        uintptr_t gs = game::at<uintptr_t>(game::kGameMain, 0);
+        if (gs && sscanf(line + 9, "%d %x %x", &from, &off, &len) == 3 && from >= 0 && from < kPawns && off + len <= 0x50) {
+            uintptr_t a = possess_arisen(), b = possess_pawn_ptr(from);
+            uintptr_t pa = a ? game::at<uintptr_t>(a, 0x3DEC) : 0, pb = b ? game::at<uintptr_t>(b, 0x3DEC) : 0;
+            if (pa && pb) {
+                memcpy(reinterpret_cast<void *>(pa + off), reinterpret_cast<void *>(pb + off), len);
+                memcpy(reinterpret_cast<void *>(gs + 0xA76D0 + off), reinterpret_cast<void *>(pb + off), len);
+                game::at<int32_t>(gs, 0xAC3C0) = 1;
+                logf("bridge: lookfrom pawn %d +%X %X bytes, refresh asked", from, off, len);
+            }
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "rebuild ", 8) == 0) {
+        g_rebuild_who = atoi(line + 8);
+        strcpy(g_current, line);
+    } else if (strncmp(line, "chptrw ", 7) == 0) {
+        int who = -2, n = 0;
+        unsigned po = 0, off = 0;
+        if (sscanf(line + 7, "%d %x %x%n", &who, &po, &off, &n) == 3 && who >= -1 && who < kPawns && po < 0x8000) {
+            uintptr_t ch = who < 0 ? possess_arisen() : possess_pawn_ptr(who);
+            uintptr_t o = ch ? game::at<uintptr_t>(ch, po) : 0;
+            const char *p = line + 7 + n;
+            int v = 0, used = 0, k = 0;
+            while (o && k < 32 && sscanf(p, "%d%n", &v, &used) == 1 && mem_readable(reinterpret_cast<void *>(o + off + 2 * k), 2)) {
+                game::at<int16_t>(o, off + 2 * k++) = int16_t(v);
+                p += used;
+            }
+            logf("bridge: chptrw %d [+%X]+%X: %d words", who, po, off, k);
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "items ", 6) == 0) {
+        int m = atoi(line + 6);
+        uintptr_t mgr = game::at<uintptr_t>(game::va(0x018FA4D4), 0);
+        if (mgr && m >= 0 && m < 4) {
+            uintptr_t list = mgr + 0x178 + uintptr_t(m) * 0x11E8;
+            uint32_t n = game::at<uint32_t>(list, 8);
+            uintptr_t *it = game::at<uintptr_t *>(list, 0x14);
+            char buf[1500];
+            int len = snprintf(buf, sizeof buf, "bridge: items %d: %u at %p:", m, n, (void *)it);
+            for (uint32_t k = 0; it && n <= 512 && mem_readable(it, n * sizeof *it) && k < n && len < 1400; ++k)
+                if (it[k] && mem_readable(reinterpret_cast<void *>(it[k]), 0x24))
+                    len += snprintf(buf + len, sizeof buf - len, " %d:%X", game::at<int16_t>(it[k], 0x10), game::at<uint32_t>(it[k], 0x20));
+            logf("%s", buf);
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "equip ", 6) == 0) {
+        int m = atoi(line + 6);
+        uintptr_t mgr = game::at<uintptr_t>(game::va(0x018FA4D4), 0);
+        if (mgr && m >= 0 && m < 4) {
+            uintptr_t bag = mgr + 0x178 + uintptr_t(m) * 0x11E8;
+            char buf[600];
+            int len = snprintf(buf, sizeof buf, "bridge: equip %d (bag %p):", m, (void *)bag);
+            for (int k = 0; k < 12; ++k) {
+                uintptr_t it = game::at<uintptr_t>(bag, 0x258 + 4 * k);
+                if (it && mem_readable(reinterpret_cast<void *>(it), 0x24))
+                    len += snprintf(buf + len, sizeof buf - len, " %d:%X", game::at<int16_t>(it, 0x10), game::at<uint32_t>(it, 0x20));
+                else
+                    len += snprintf(buf + len, sizeof buf - len, " -");
+            }
+            logf("%s", buf);
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "eqset ", 6) == 0) {
+        int m = -1, k = -1, fm = -1, fk = -1;
+        uintptr_t mgr = game::at<uintptr_t>(game::va(0x018FA4D4), 0);
+        if (mgr && sscanf(line + 6, "%d %d %d %d", &m, &k, &fm, &fk) == 4 && m >= 0 && m < 4 && fm >= 0 && fm < 4 &&
+            k >= 0 && k < 12 && fk >= 0 && fk < 12) {
+            uintptr_t &to = game::at<uintptr_t>(mgr, 0x3D0 + (m * 0x47A + k) * 4);
+            uintptr_t from = game::at<uintptr_t>(mgr, 0x3D0 + (fm * 0x47A + fk) * 4);
+            logf("bridge: eqset member %d slot %d: %p -> %p", m, k, (void *)to, (void *)from);
+            to = from;
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "chset ", 6) == 0) {
+        int who = -2;
+        unsigned off = 0, v = 0;
+        if (sscanf(line + 6, "%d %x %x", &who, &off, &v) == 3 && who >= -1 && who < kPawns) {
+            uintptr_t ch = who < 0 ? possess_arisen() : possess_pawn_ptr(who);
+            if (ch && off < 0x8000) {
+                uint32_t was = game::at<uint32_t>(ch, off);
+                game::at<uint32_t>(ch, off) = v;
+                logf("bridge: chset %s %d +%X: %08X -> %08X", who < 0 ? "arisen" : "pawn", who, off, was, v);
+            }
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "chptr ", 6) == 0) {
+        unsigned po = 0, off = 0, count = 0;
+        if (sscanf(line + 6, "%x %x %u", &po, &off, &count) == 3 && count > 0 && count <= 64 && po < 0x8000)
+            for (int p = -1; p < kPawns; ++p) {
+                uintptr_t ch = p < 0 ? possess_arisen() : possess_pawn_ptr(p);
+                uintptr_t o = ch ? game::at<uintptr_t>(ch, po) : 0;
+                if (!o || !mem_readable(reinterpret_cast<void *>(o + off), count))
+                    continue;
+                char hex[200] = "";
+                for (unsigned k = 0; k < count; ++k)
+                    _snprintf(hex + strlen(hex), sizeof hex - strlen(hex), "%02X ", game::at<uint8_t>(o, off + k));
+                logf("bridge: chptr %s %d [+%X]+%X: %s", p < 0 ? "arisen" : "pawn", p, po, off, hex);
+            }
+        _snprintf(g_current, sizeof g_current, "chptr %X %X", po, off);
+    } else if (strncmp(line, "chbytes ", 8) == 0) {
+        unsigned off = 0, count = 0;
+        if (sscanf(line + 8, "%x %u", &off, &count) == 2 && count > 0 && count <= 64)
+            for (int p = -1; p < kPawns; ++p) {
+                uintptr_t ch = p < 0 ? possess_arisen() : possess_pawn_ptr(p);
+                if (!ch)
+                    continue;
+                char hex[200] = "";
+                for (unsigned k = 0; k < count; ++k)
+                    _snprintf(hex + strlen(hex), sizeof hex - strlen(hex), "%02X ", game::at<uint8_t>(ch, off + k));
+                logf("bridge: chbytes %s %d +%X: %s", p < 0 ? "arisen" : "pawn", p, off, hex);
+            }
+        _snprintf(g_current, sizeof g_current, "chbytes %X", off);
+    } else if (strncmp(line, "gsbytes ", 8) == 0 || strncmp(line, "gsset ", 6) == 0) {
+        uintptr_t gm = game::at<uintptr_t>(game::kGameMain, 0);
+        unsigned off = 0, v = 0;
+        if (gm && line[2] == 'b' && sscanf(line + 8, "%x %u", &off, &v) == 2 && v > 0 && v <= 32) {
+            char hex[120] = "";
+            for (unsigned k = 0; k < v; ++k)
+                _snprintf(hex + strlen(hex), sizeof hex - strlen(hex), "%02X ", game::at<uint8_t>(gm, off + k));
+            logf("bridge: gsbytes +%X: %s", off, hex);
+        } else if (gm && line[2] == 's' && sscanf(line + 6, "%x %u", &off, &v) == 2) {
+            game::at<uint8_t>(gm, off) = uint8_t(v);
+            logf("bridge: gsset +%X = %u", off, v);
+        }
+        strcpy(g_current, line);
+    } else if (strcmp(line, "chsnap") == 0 || strcmp(line, "chdiff") == 0) {
+        static uint8_t snap[0x8000];
+        static bool have = false;
+        uintptr_t a = possess_arisen();
+        if (!a)
+            if (uintptr_t party = game::at<uintptr_t>(game::va(0x018FA4EC), 0))
+                a = game::at<uintptr_t>(party, 0x99C);
+        if (a && !mem_readable(reinterpret_cast<void *>(a), sizeof snap))
+            a = 0;
+        if (a && line[2] == 's') {
+            memcpy(snap, reinterpret_cast<void *>(a), sizeof snap);
+            have = true;
+            logf("bridge: chsnap of the Arisen %08X", unsigned(a));
+        } else if (a && have) {
+            int n = 0;
+            for (unsigned off = 0; off < sizeof snap && n < 400; off += 4) {
+                uint32_t was, now;
+                memcpy(&was, snap + off, 4);
+                memcpy(&now, reinterpret_cast<void *>(a + off), 4);
+                if (was != now) {
+                    logf("bridge: chdiff +%04X: %08X -> %08X", off, was, now);
+                    ++n;
+                }
+            }
+            logf("bridge: chdiff: %d words changed (400 shown at most)", n);
+        }
+        strcpy(g_current, line);
+    } else if (strncmp(line, "actname", 7) == 0) {
+        for (int p = -1; p < kPawns; ++p) {
+            uintptr_t ch = p < 0 ? possess_arisen() : possess_pawn_ptr(p);
+            if (!ch)
+                continue;
+            logf("bridge: actname %s %d %s no %X (+2DD0 %08X +2DD4 %08X +2DDC %08X) lift %08X kind %d", p < 0 ? "arisen" : "pawn", p,
+                 action_name(ch), game::at<uint32_t>(ch, 0x2DD8), game::at<uint32_t>(ch, 0x2DD0), game::at<uint32_t>(ch, 0x2DD4),
+                 game::at<uint32_t>(ch, 0x2DDC), game::at<uint32_t>(ch, 0x38F0), game::at<int32_t>(ch, 0x3938));
+        }
+        strcpy(g_current, "actname");
+    } else if (strncmp(line, "questadd ", 9) == 0) {
+        unsigned id = 0;
+        if (sscanf(line + 9, "%x", &id) == 1)
+            quest_live_queue(id);
+        logf("bridge: questadd %08X (journal %d)", id, quest_live_count());
+        _snprintf(g_current, sizeof g_current, "questadd %08X", id);
+    } else if (sscanf(line, "snapg %u", &slot) == 1 && slot < 3) {
+        constexpr uintptr_t lo = 0x01621000, hi = 0x019AB1E0;
+        constexpr size_t n = (hi - lo) / 4;
+        auto &snap = g_snaps[slot];
+        snap.assign(n, 0);
+        SIZE_T got = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(lo), snap.data(), hi - lo, &got);
+        if (slot == 0) {
+            g_snap_objs.clear();
+            for (size_t k = 0; k < n && g_snap_objs.size() < 20000; ++k) {
+                uint32_t vt = 0;
+                if (snap[k] >= 0x10000 && snap[k] < 0x7FFF0000 && !(snap[k] & 3) &&
+                    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(uintptr_t(snap[k])), &vt, 4, &got) &&
+                    vt >= 0x00401000 && vt < 0x01A0C000)
+                    g_snap_objs.push_back(uint32_t(k));
+            }
+        }
+        snap.resize(n + g_snap_objs.size() * 0x100, 0);
+        for (size_t j = 0; j < g_snap_objs.size(); ++j)
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(uintptr_t(snap[g_snap_objs[j]])), &snap[n + j * 0x100], 0x400, &got);
+        logf("bridge: snapg %u taken (%u objects)", slot, unsigned(g_snap_objs.size()));
+        _snprintf(g_current, sizeof g_current, "snapg %u", slot);
+    } else if (strncmp(line, "gpoke ", 6) == 0) {
+        unsigned g = 0, off = 0, v = 0, dur = 0;
+        if (sscanf(line + 6, "%x %x %x %u", &g, &off, &v, &dur) == 4 && game::at<uintptr_t>(g, 0)) {
+            g_poke_addr = game::at<uintptr_t>(g, 0) + off;
+            g_poke_val = v;
+            g_poke_until = (GetTickCount() + dur) | 1;
+            logf("bridge: gpoke %08X = %08X (was %08X) for %u ms", unsigned(g_poke_addr), v, game::at<uint32_t>(g_poke_addr, 0), dur);
+            game::at<uint32_t>(g_poke_addr, 0) = v;
+        }
+        _snprintf(g_current, sizeof g_current, "gpoke %X", off);
+    } else if (strncmp(line, "chpoke ", 7) == 0) {
+        unsigned off = 0, dur = 0;
+        float v = 0.f;
+        uintptr_t a = possess_arisen();
+        if (sscanf(line + 7, "%x %f %u", &off, &v, &dur) == 3 && a && off < 0x8000) {
+            g_poke_addr = a + off;
+            memcpy(&g_poke_val, &v, 4);
+            g_poke_until = (GetTickCount() + dur) | 1;
+            logf("bridge: chpoke Arisen +%X = %.3f (was %.3f) for %u ms", off, v, game::at<float>(a, off), dur);
+        }
+        _snprintf(g_current, sizeof g_current, "chpoke %X", off);
+    } else if (strncmp(line, "peek ", 5) == 0) {
+        char buf[300] = "";
+        int len = 0;
+        unsigned addr = 0;
+        int used = 0;
+        for (const char *q = line + 5; sscanf(q, "%x%n", &addr, &used) == 1 && len < 260; q += used) {
+            uint32_t v = 0;
+            SIZE_T got = 0;
+            bool ok = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void *>(uintptr_t(addr)), &v, 4, &got);
+            len += _snprintf(buf + len, sizeof buf - len, " %08X=%s%08X", addr, ok ? "" : "?", v);
+        }
+        logf("bridge: peek%s", buf);
+        strcpy(g_current, "peek");
+    } else if (strncmp(line, "diffg", 5) == 0) {
+        constexpr uintptr_t lo = 0x01621000, hi = 0x019AB1E0;
+        constexpr size_t n = (hi - lo) / 4;
+        int hits = 0;
+        bool cell = strstr(line, "cell") != nullptr;
+        if (g_snaps[0].size() == g_snaps[1].size() && g_snaps[1].size() == g_snaps[2].size() && !g_snaps[0].empty())
+            for (size_t k = 0; k < g_snaps[0].size() && hits < 80; ++k) {
+                uint32_t a0 = g_snaps[0][k], a1 = g_snaps[1][k], a2 = g_snaps[2][k];
+                if (a0 != a2 || a0 == a1)
+                    continue;
+                if (cell) {
+                    int32_t di = int32_t(a1 - a0);
+                    int16_t lo0 = int16_t(a0 & 0xFFFF), lo1 = int16_t(a1 & 0xFFFF), hi0 = int16_t(a0 >> 16), hi1 = int16_t(a1 >> 16);
+                    float f0, f1;
+                    memcpy(&f0, &a0, 4);
+                    memcpy(&f1, &a1, 4);
+                    bool one = di == 1 || di == -1 || (hi0 == hi1 && (lo1 - lo0 == 1 || lo1 - lo0 == -1)) ||
+                               (lo0 == lo1 && (hi1 - hi0 == 1 || hi1 - hi0 == -1));
+                    float df = std::fabs(f1 - f0);
+                    bool ten = f0 == f0 && f1 == f1 && df > 9999.f && df < 10001.f;
+                    if (!one && !ten)
+                        continue;
+                }
+                if (k >= n) {
+                    size_t gk = g_snap_objs[(k - n) / 0x100];
+                    if (g_snaps[0][gk] != g_snaps[1][gk] || g_snaps[0][gk] != g_snaps[2][gk])
+                        continue;
+                    logf("bridge: diffg [%08X]+0x%X: %08X -> %08X -> %08X", unsigned(lo + gk * 4), unsigned((k - n) % 0x100 * 4), a0, a1, a2);
+                } else {
+                    logf("bridge: diffg %08X: %08X -> %08X -> %08X", unsigned(lo + k * 4), a0, a1, a2);
+                }
+                ++hits;
+            }
+        logf("bridge: diffg %d", hits);
+        strcpy(g_current, "diffg");
+    } else if (strncmp(line, "watchg ", 7) == 0) {
+        unsigned g = 0, off = 0, count = 20;
+        uintptr_t addr = 0;
+        if (sscanf(line + 7, "%x %x %u", &g, &off, &count) >= 2 && game::at<uintptr_t>(g, 0)) {
+            addr = game::at<uintptr_t>(g, 0) + off;
+            logf("bridge: watchg [%08X]+%X = %08X: %u", g, off, unsigned(addr), game::at<uint32_t>(addr, 0));
+            watch_start(addr, long(count), 0);
+        }
+        _snprintf(g_current, sizeof g_current, "watchg %08X+%X", g, off);
+    } else if (strncmp(line, "watcha ", 7) == 0) {
+        unsigned addr = 0, count = 20;
+        if (sscanf(line + 7, "%x %u", &addr, &count) >= 1 && mem_readable((void *)uintptr_t(addr), 4)) {
+            logf("bridge: watcha %08X = %u", addr, game::at<uint32_t>(addr, 0));
+            watch_start(addr, long(count), 0);
+        }
+        _snprintf(g_current, sizeof g_current, "watcha %08X", addr);
+    } else if (strncmp(line, "camscan", 7) == 0) {
+        uintptr_t holder = game::at<uintptr_t>(0, game::va(0x018D0B6C)), ar = possess_arisen();
+        uintptr_t cam = holder ? game::at<uintptr_t>(holder, 0x34) : 0;
+        logf("bridge: camscan holder %p camera %p arisen %p vt %08X", (void *)holder, (void *)cam, (void *)ar,
+             cam ? unsigned(game::at<uintptr_t>(cam, 0)) : 0u);
+        uintptr_t m0 = cam ? game::at<uintptr_t>(cam, 0x180) : 0, m1 = cam ? game::at<uintptr_t>(cam, 0x184) : 0,
+                  m2 = cam ? game::at<uintptr_t>(cam, 0x188) : 0;
+        logf("bridge: camscan modes %p %p %p (vt %08X %08X %08X)", (void *)m0, (void *)m1, (void *)m2,
+             m0 ? unsigned(game::at<uintptr_t>(m0, 0)) : 0u, m1 ? unsigned(game::at<uintptr_t>(m1, 0)) : 0u,
+             m2 ? unsigned(game::at<uintptr_t>(m2, 0)) : 0u);
+        const struct { uintptr_t base; size_t len; const char *name; } areas[] = {
+            {holder, 0x400, "holder"}, {cam, 0x2400, "camera"}, {m0, 0x1000, "mode+180"}, {m1, 0x1000, "mode+184"},
+            {m2, 0x1000, "mode+188"}};
+        for (const auto &a : areas)
+            if (a.base && ar)
+                for (size_t o = 0; o + 4 <= a.len; o += 4)
+                {
+                    uintptr_t v = game::at<uintptr_t>(a.base, o);
+                    if (v >= ar && v < ar + 0x5A10)
+                        logf("bridge: camscan %s +0x%X points into the Arisen at +0x%X", a.name, unsigned(o),
+                             unsigned(v - ar));
+                }
+        strcpy(g_current, "camscan");
+    } else if (strncmp(line, "dump ", 5) == 0) {
+        char name[64] = {};
+        sscanf(line + 5, "%63s", name);
+        const struct { uintptr_t ch; const char *who; size_t size; } objs[] = {
+            {possess_arisen(), "arisen", 0x5A10}, {possess_main_pawn(), "pawn", 0x58E0}};
+        for (const auto &o : objs) {
+            if (!o.ch)
+                continue;
+            char path[128];
+            _snprintf(path, sizeof path, "dump_%s_%s.bin", name, o.who);
+            if (FILE *f = fopen(path, "wb")) {
+                fwrite(reinterpret_cast<const void *>(o.ch), 1, o.size, f);
+                fclose(f);
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "dump %s", name);
+    } else if (strncmp(line, "edump ", 6) == 0) {
+        char name[64] = {};
+        sscanf(line + 6, "%63s", name);
+        if (strcmp(name, "@") == 0) {
+            SYSTEMTIME t;
+            GetLocalTime(&t);
+            _snprintf(name, sizeof name, "%02u%02u%02u", t.wHour, t.wMinute, t.wSecond);
+        }
+        enemies_dump(name);
+        _snprintf(g_current, sizeof g_current, "edump %s", name);
+    } else if (strncmp(line, "ederef ", 7) == 0) {
+        char name[64] = {};
+        unsigned off = 0;
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128);
+        if (sscanf(line + 7, "%63s %x", name, &off) == 2)
+            for (int k = 0; k < n; ++k) {
+                uintptr_t p = game::at<uintptr_t>(list[k].ptr, off);
+                if (!mem_readable((void *)p, 0x2000))
+                    continue;
+                char path[128];
+                _snprintf(path, sizeof path, "deref_%s_e%d.bin", name, list[k].index);
+                if (FILE *f = fopen(path, "wb")) {
+                    fwrite(reinterpret_cast<const void *>(p), 1, 0x2000, f);
+                    fclose(f);
+                }
+            }
+        _snprintf(g_current, sizeof g_current, "ederef %s +%X", name, off);
+    } else if (sscanf(line, "ewatchhp #%u %u", &slot, &ms) == 2) {
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128);
+        for (int k = 0; k < n; ++k)
+            if (unsigned(list[k].index) == slot)
+                if (float *hp = enemies_hp(list[k].ptr)) {
+                    logf("bridge: ewatchhp #%u %s HP %.1f / %.1f at %p", slot, list[k].name, hp[0], hp[1], (void *)hp);
+                    watch_start(reinterpret_cast<uintptr_t>(hp), long(ms), 0, true);
+                }
+        _snprintf(g_current, sizeof g_current, "ewatchhp #%u", slot);
+    } else if (strncmp(line, "ehp #", 5) == 0) {
+        unsigned dead = 0, inv = 0;
+        float v = 0.f;
+        if (sscanf(line + 5, "%u %f %u %u", &slot, &v, &dead, &inv) == 4) {
+            EnemySlot list[128];
+            int n = enemies_snapshot(list, 128);
+            for (int k = 0; k < n; ++k)
+                if (unsigned(list[k].index) == slot)
+                    if (float *hp = enemies_hp(list[k].ptr)) {
+                        uintptr_t entry = reinterpret_cast<uintptr_t>(hp) - 8;
+                        logf("bridge: ehp #%u %s HP %.1f -> %.1f, +0x30 %02X, +0x110 %02X", slot, list[k].name, hp[0], v,
+                             game::at<uint8_t>(entry, 0x30), game::at<uint8_t>(entry, 0x110));
+                        hp[0] = v;
+                        if (dead)
+                            game::at<uint8_t>(entry, 0x110) |= 1;
+                        if (inv)
+                            game::at<uint8_t>(entry, 0x30) |= 1;
+                    }
+        }
+        _snprintf(g_current, sizeof g_current, "ehp #%u", slot);
+    } else if (strncmp(line, "ekill ", 6) == 0) {
+        char cls[24] = {}, fld[16] = {};
+        int got = sscanf(line + 6, "%23s %15s", cls, fld);
+        unsigned off = 0;
+        bool by_field = got == 2 && fld[0] == 'f' && sscanf(fld + 1, "%x", &off) == 1;
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128), hit = -1;
+        for (int k = 0; k < n && hit < 0; ++k) {
+            const EnemySlot &e = list[k];
+            if (e.died || (strcmp(cls, "*") != 0 && strcmp(cls, e.name) != 0))
+                continue;
+            if (by_field && (!e.lot_part || (e.lot_part & 0xC000) != 0 || unsigned(e.lot_part & 0x3FFF) * 4 != off))
+                continue;
+            hit = k;
+        }
+        if (hit >= 0) {
+            enemies_queue_kill(list[hit].ptr);
+            logf("bridge: ekill %s: #%d %s %p", line + 6, list[hit].index, list[hit].name, (void *)list[hit].ptr);
+        } else {
+            logf("bridge: ekill %s: no living enemy like that", line + 6);
+        }
+        _snprintf(g_current, sizeof g_current, "ekill %s", line + 6);
+    } else if (strncmp(line, "edel ", 5) == 0) {
+        char cls[24] = {}, sel[16] = {};
+        int got = sscanf(line + 5, "%23s %15s", cls, sel);
+        unsigned want = 0;
+        bool by_id = got == 2 && sel[0] == '#' && sscanf(sel + 1, "%u", &want) == 1;
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128), hit = -1;
+        for (int k = 0; k < n && hit < 0; ++k) {
+            const EnemySlot &e = list[k];
+            if (e.died || (strcmp(cls, "*") != 0 && strcmp(cls, e.name) != 0) || (by_id && (e.lot_part || e.lot_id != want)))
+                continue;
+            hit = k;
+        }
+        if (hit >= 0) {
+            enemies_queue_delete(list[hit].ptr);
+            logf("bridge: edel %s: #%d %s %p (entry %u)", line + 5, list[hit].index, list[hit].name, (void *)list[hit].ptr,
+                 unsigned(list[hit].lot_id));
+        } else {
+            logf("bridge: edel %s: no living enemy like that", line + 5);
+        }
+        _snprintf(g_current, sizeof g_current, "edel %s", line + 5);
+    } else if (strncmp(line, "ereq ", 5) == 0) {
+        char cls[32] = {};
+        unsigned n = 0;
+        if (sscanf(line + 5, "%31s %x", cls, &n) == 2)
+            emact_test_request(cls, n);
+        logf("bridge: ereq %s", line + 5);
+        _snprintf(g_current, sizeof g_current, "ereq %s", line + 5);
+    } else if (strncmp(line, "ecatch ", 7) == 0) {
+        char cls[32] = {};
+        int who = -1;
+        uintptr_t v = 0;
+        if (sscanf(line + 7, "%31s %d", cls, &who) == 2 && who >= 0 && who < 4)
+            v = net_slot_character(who);
+        if (v)
+            emact_test_catch(cls, v);
+        logf("bridge: ecatch %s: %s", line + 7, v ? "set" : "no such character here");
+        _snprintf(g_current, sizeof g_current, "ecatch %s", line + 7);
+    } else if (strncmp(line, "ehide ", 6) == 0) {
+        int group = -1, entry = 0;
+        if (strncmp(line + 6, "off", 3) != 0 && sscanf(line + 6, "%d %d", &group, &entry) != 2)
+            group = -1;
+        bool keep = strstr(line + 6, "keep") != nullptr;
+        net_test_hide(group, entry, keep);
+        logf("bridge: ehide %s: %s", line + 6, group < 0 ? "nothing hidden" : keep ? "its states are no longer sent (still listed)"
+                                                                         : "that unit is no longer sent");
+        _snprintf(g_current, sizeof g_current, "ehide %s", line + 6);
+    } else if (strncmp(line, "slots", 5) == 0) {
+        uintptr_t sm = game::at<uintptr_t>(0x018FA504, 0);
+        if (sm && mem_readable(reinterpret_cast<void *>(sm + 0x844), 10 * 32)) {
+            LONG reqs = 0, moved = 0;
+            enemies_slot_stats(&reqs, &moved);
+            logf("bridge: slots (count %d; near %.0f, far %.0f, score step %d; %ld requests since the last look, %ld scored "
+                 "by another player of the group):", game::at<int32_t>(sm, 0x1B8D0), game::at<float>(sm, 0x1B8D4),
+                 game::at<float>(sm, 0x1B8DC), game::at<int32_t>(sm, 0x1B8E4), long(reqs), long(moved));
+            for (int s = 0; s < 10; ++s) {
+                const uint32_t *w = reinterpret_cast<const uint32_t *>(sm + 0x844 + s * 32);
+                float up[3] = {};
+                bool upos = w[1] && mem_readable(reinterpret_cast<void *>(uintptr_t(w[1]) + 0x40), 12);
+                if (upos)
+                    memcpy(up, reinterpret_cast<void *>(uintptr_t(w[1]) + 0x40), sizeof up);
+                logf("bridge:   slot %d: %08X %08X state %u %08X %08X key %08X (e%02u #%u) %08X %08X%s%.0f, %.0f, %.0f%s", s, w[0],
+                     w[1], w[2], w[3], w[4], w[5], w[5] & 0xFFFF, w[5] >> 16, w[6], w[7], upos ? " at (" : "", up[0], up[1],
+                     up[2], upos ? ")" : "");
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "slots");
+    } else if (strncmp(line, "groups", 6) == 0 && strncmp(line, "groupslots", 10) != 0) {
+        uintptr_t sm = game::at<uintptr_t>(0x018FA504, 0), gs = game::at<uintptr_t>(0x018FA4BC, 0);
+        uintptr_t sp = game::at<uintptr_t>(0x018D099C, 0), st = 0;
+        int idx = -1;
+        if (sp && mem_readable(reinterpret_cast<void *>(sp + 0x3834), 4))
+            st = game::at<uintptr_t>(sp, 0x3834);
+        if (st && mem_readable(reinterpret_cast<void *>(st + 0x72C), 4))
+            idx = game::at<int32_t>(st, 0x72C);
+        auto flag = [&](unsigned n) -> const char * {
+            if (!gs || idx < 0 || idx > 64 || n >= 0x80)
+                return "?";
+            uint32_t w = game::at<uint32_t>(gs, 0xADEE8 + (uint32_t(idx) * 0x53 + (n >> 5)) * 4);
+            return (w & (0x80000000u >> (n & 31))) ? "set" : "not set";
+        };
+        uint32_t count = sm && mem_readable(reinterpret_cast<void *>(sm + 0x15AB0), 0x10) ? game::at<uint32_t>(sm, 0x15AB0) : 0;
+        uintptr_t arr = count ? game::at<uintptr_t>(sm, 0x15ABC) : 0;
+        if (gs && idx >= 0 && idx <= 64)
+            logf("bridge: groups: %u, stage index %d, its flag words 1-3: %08X %08X %08X", unsigned(count), idx,
+                 game::at<uint32_t>(gs, 0xADEE8 + uint32_t(idx) * 0x14C + 4), game::at<uint32_t>(gs, 0xADEE8 + uint32_t(idx) * 0x14C + 8),
+                 game::at<uint32_t>(gs, 0xADEE8 + uint32_t(idx) * 0x14C + 12));
+        for (uint32_t i = 0; arr && i < count && i < 128; ++i) {
+            if (!mem_readable(reinterpret_cast<void *>(arr + i * 4), 4))
+                break;
+            uintptr_t gp = game::at<uintptr_t>(arr, i * 4);
+            if (!gp || !mem_readable(reinterpret_cast<void *>(gp), 0x30) || game::at<uintptr_t>(gp, 0) != 0x01617C68)
+                continue;
+            uint32_t c = game::at<uint32_t>(gp, 0x20);
+            unsigned f1 = game::at<uint16_t>(gp, 0x2C), f2 = game::at<uint16_t>(gp, 0x2E);
+            char need[96] = "no LOT flag";
+            if (c & 2) {
+                int n = _snprintf(need, sizeof need, "LOT flag %u (%s)", f1, flag(f1));
+                if ((c & 8) && n > 0)
+                    _snprintf(need + n, sizeof need - n, " and %u (%s)", f2, flag(f2));
+            }
+            logf("bridge:   group e%02u: needs %s; conditions %08X", game::at<uint32_t>(gp, 0x1C) & 0x1FF, need, c);
+        }
+        _snprintf(g_current, sizeof g_current, "groups");
+    } else if (strncmp(line, "sets", 4) == 0) {
+        uintptr_t sm = game::at<uintptr_t>(0x018FA504, 0);
+        uint32_t n = sm && mem_readable(reinterpret_cast<void *>(sm + 0x15A58), 0x10) ? game::at<uint32_t>(sm, 0x15A58) : 0;
+        uintptr_t arr = n ? game::at<uintptr_t>(sm, 0x15A64) : 0;
+        LONG asks = 0, others = 0, masks = 0;
+        enemies_area_stats(&asks, &others, &masks);
+        char dom[64] = "";
+        if (sm && mem_readable(reinterpret_cast<void *>(sm + 0x15A14), 12))
+            for (int c = 0; c < 3; ++c) {
+                uintptr_t g = game::at<uintptr_t>(sm, 0x15A14 + c * 4);
+                size_t l = strlen(dom);
+                _snprintf(dom + l, sizeof dom - l, " %d:%s%02u", c, g ? "e" : "-",
+                          g && mem_readable(reinterpret_cast<void *>(g + 0x1C), 4) ? game::at<uint32_t>(g, 0x1C) & 0x1FF : 0);
+            }
+        logf("bridge: sets: %u; dominant group per class%s; group area checks since the last look: %ld outside this "
+             "Arisen, %ld of them inside another player's; area masks widened by another player's box hits: %ld",
+             unsigned(n), dom, long(asks), long(others), long(masks));
+        for (uint32_t i = 0; arr && i < n && i < 96; ++i) {
+            if (!mem_readable(reinterpret_cast<void *>(arr + i * 4), 4))
+                break;
+            uintptr_t st = game::at<uintptr_t>(arr, i * 4);
+            if (!st || !mem_readable(reinterpret_cast<void *>(st), 0x98))
+                continue;
+            uint32_t entries = game::at<uint32_t>(st, 0xC), alive = 0;
+            uintptr_t units = game::at<uintptr_t>(st, 0x18);
+            for (uint32_t k = 0; units && k < entries && k < 64 && mem_readable(reinterpret_cast<void *>(units + k * 4), 4); ++k)
+                alive += game::at<uintptr_t>(units, k * 4) != 0;
+            uintptr_t gp = game::at<uintptr_t>(st, 0x74);
+            char shapes[400] = "";
+            int len = 0;
+            uint32_t g34 = 0, ns = 0;
+            char gstate[160] = "";
+            if (gp && mem_readable(reinterpret_cast<void *>(gp), 0x170)) {
+                char kinds[64] = "";
+                int kl = 0;
+                uint32_t nk = game::at<uint32_t>(gp, 0x8C);
+                uintptr_t ka = game::at<uintptr_t>(gp, 0x98);
+                for (uint32_t k = 0; ka && k < nk && k < 8 && mem_readable(reinterpret_cast<void *>(ka + k * 4), 4); ++k) {
+                    uintptr_t ke = game::at<uintptr_t>(ka, k * 4);
+                    uintptr_t kp = ke && mem_readable(reinterpret_cast<void *>(ke + 0x2C), 4) ? game::at<uintptr_t>(ke, 0x2C) : 0;
+                    int idx = -1;
+                    for (int t = 0; t < 400 && kp && idx < 0 && mem_readable(reinterpret_cast<void *>(0x0150F724 + t * 16), 4); ++t)
+                        if (game::at<uintptr_t>(0x0150F724 + uintptr_t(t) * 16, 0) == kp)
+                            idx = t;
+                    if (kl >= 0 && size_t(kl) < sizeof kinds - 8)
+                        kl += _snprintf(kinds + kl, sizeof kinds - kl, " %d", idx);
+                }
+                _snprintf(gstate, sizeof gstate, "class %u, state %08X, on %u, %u areas%s, kinds%s",
+                          game::at<uint32_t>(gp, 0x18), game::at<uint32_t>(gp, 0x15C), game::at<uint8_t>(gp, 0x15E),
+                          game::at<uint32_t>(gp, 0x70), game::at<uint8_t>(gp, 0x130) ? " (linked group's)" : "",
+                          *kinds ? kinds : " none");
+            }
+            if (gp && mem_readable(reinterpret_cast<void *>(gp), 0x160)) {
+                g34 = game::at<uint32_t>(gp, 0x34);
+                ns = game::at<uint32_t>(gp, 0x14C);
+                uintptr_t sh = game::at<uintptr_t>(gp, 0x158);
+                for (uint32_t k = 0; sh && k < ns && k < 6 && mem_readable(reinterpret_cast<void *>(sh + k * 4), 4); ++k) {
+                    uintptr_t s = game::at<uintptr_t>(sh, k * 4);
+                    if (s && mem_readable(reinterpret_cast<void *>(s), 0x18) && len >= 0 && size_t(len) < sizeof shapes - 90) {
+                        uintptr_t b = game::at<uintptr_t>(s, 0x14);
+                        bool bb = b && mem_readable(reinterpret_cast<void *>(b + 0x40), 0x20);
+                        len += _snprintf(shapes + len, sizeof shapes - len, " %08X:vt %08X f %X", unsigned(s),
+                                         game::at<uint32_t>(s, 0), game::at<uint32_t>(s, 0x10));
+                        if (bb)
+                            len += _snprintf(shapes + len, sizeof shapes - len, " (%.0f %.0f %.0f .. %.0f %.0f %.0f)",
+                                             game::at<float>(b, 0x40), game::at<float>(b, 0x44), game::at<float>(b, 0x48),
+                                             game::at<float>(b, 0x50), game::at<float>(b, 0x54), game::at<float>(b, 0x58));
+                    }
+                }
+            }
+            char areas[120] = "";
+            int al = 0;
+            uintptr_t list = game::at<uintptr_t>(st, 4);
+            uintptr_t lvt = list && mem_readable(reinterpret_cast<void *>(list), 4) ? game::at<uintptr_t>(list, 0) : 0;
+            if (lvt && mem_readable(reinterpret_cast<void *>(lvt + 0x3C), 4)) {
+                using Entry_t = uintptr_t(__fastcall *)(uintptr_t, void *, int);
+                for (uint32_t k = 0; k < entries && k < 16 && al >= 0 && size_t(al) < sizeof areas - 8; ++k) {
+                    uintptr_t e = reinterpret_cast<Entry_t>(game::at<uintptr_t>(lvt, 0x3C))(list, nullptr, int(k));
+                    uintptr_t si = e && mem_readable(reinterpret_cast<void *>(e + 8), 4) ? game::at<uintptr_t>(e, 8) : 0;
+                    int a = si && mem_readable(reinterpret_cast<void *>(si + 0x70), 4) ? game::at<int32_t>(si, 0x70) : -9;
+                    al += _snprintf(areas + al, sizeof areas - al, " %d", a);
+                }
+            }
+            logf("bridge:   set %u: e%02u, %u entries, %u spawned, group %s; +31 %u +32 %u +41..44 %u%u%u%u, area mask %08X, "
+                 "entry areas%s, group +34 %08X, %u shapes%s", unsigned(i), (game::at<uint32_t>(st, 0x48) >> 10) & 0x1FF,
+                 unsigned(entries), unsigned(alive), gstate, game::at<uint8_t>(st, 0x31), game::at<uint8_t>(st, 0x32),
+                 game::at<uint8_t>(st, 0x41), game::at<uint8_t>(st, 0x42), game::at<uint8_t>(st, 0x43),
+                 game::at<uint8_t>(st, 0x44), game::at<uint32_t>(st, 0x78), areas, unsigned(g34), unsigned(ns), shapes);
+        }
+        _snprintf(g_current, sizeof g_current, "sets");
+    } else if (strcmp(line, "ids") == 0 || strncmp(line, "ids ", 4) == 0) {
+        static EnemySlot list[128];
+        int n = enemies_snapshot(list, 128), placed = 0;
+        for (int k = 0; k < n; ++k)
+            placed += lot_placed(list[k]) ? 1 : 0;
+        logf("bridge: ids: %d live units, %d placed", n, placed);
+        for (int k = 0; k < n; ++k) {
+            const EnemySlot &s = list[k];
+            if (!lot_known(s.lot_key, s.lot_id))
+                logf("bridge:   id #%d %s lot none%s", s.index, s.name, s.died ? " dead" : "");
+            else
+                logf("bridge:   id #%d %s lot st%u/%02um%02un/e%02u/#%u%s%s", s.index, s.name, s.lot_key & 0x3FF,
+                     unsigned(s.lot_split >> 16), unsigned(s.lot_split & 0xFFFF), unsigned(s.lot_key >> 10), unsigned(s.lot_id),
+                     s.lot_part ? " (part)" : "", s.died ? " dead" : "");
+        }
+        _snprintf(g_current, sizeof g_current, "ids");
+    } else if (strncmp(line, "deathskip ", 10) == 0) {
+        net_test_death_skip(atoi(line + 10));
+        _snprintf(g_current, sizeof g_current, "deathskip %s", line + 10);
+    } else if (strncmp(line, "followlist ", 11) == 0) {
+        net_test_follow_list(atoi(line + 11) != 0);
+        _snprintf(g_current, sizeof g_current, "followlist %s", line + 11);
+    } else if (strncmp(line, "follow", 6) == 0 && strncmp(line, "followlist", 10) != 0) {
+        enemies_follow_report(true);
+        _snprintf(g_current, sizeof g_current, "follow");
+    } else if (strncmp(line, "groupslots ", 11) == 0) {
+        net_test_group_slots(atoi(line + 11) != 0);
+        _snprintf(g_current, sizeof g_current, "groupslots %s", line + 11);
+    } else if (strncmp(line, "kind0hold ", 10) == 0) {
+        unsigned ms = 0;
+        sscanf(line + 10, "%u", &ms);
+        lottery_test_kind0_hold(ms);
+        _snprintf(g_current, sizeof g_current, "kind0hold %u", ms);
+    } else if (strncmp(line, "lotflag ", 8) == 0) {
+        int stage = 0, on = 0;
+        unsigned flag = 0;
+        uintptr_t gs = game::at<uintptr_t>(0x018FA4BC, 0);
+        int idx = -1;
+        if (sscanf(line + 8, "%d %u %d", &stage, &flag, &on) == 3)
+            for (int i = 0; i < 65 && idx < 0; ++i)
+                if (game::at<uint16_t>(0x01530348, uintptr_t(i) * 2) == stage)
+                    idx = i;
+        if (gs && idx >= 0 && flag < 0x80) {
+            auto *w = reinterpret_cast<volatile LONG *>(gs + 0xADEE8 + uint32_t(idx) * 0x14C + (flag >> 5) * 4);
+            LONG was = *w, bit = LONG(0x80000000u >> (flag & 31));
+            if (on)
+                InterlockedOr(w, bit);
+            else
+                InterlockedAnd(w, ~bit);
+            logf("bridge: lotflag stage %d (index %d) flag %u = %d: word %u %08X -> %08X", stage, idx, flag, on,
+                 flag >> 5, unsigned(was), unsigned(*w));
+        } else {
+            logf("bridge: lotflag %s: no such stage or flag", line + 8);
+        }
+        _snprintf(g_current, sizeof g_current, "lotflag %s", line + 8);
+    } else if (strncmp(line, "eset ", 5) == 0 || strncmp(line, "ewatch ", 7) == 0) {
+        bool set = line[1] == 's';
+        char cls[24] = {};
+        unsigned off = 0;
+        float v = 0.f;
+        EnemySlot list[128];
+        int n = enemies_snapshot(list, 128), hit = 0;
+        if (sscanf(line + (set ? 5 : 7), "%23s %x %f", cls, &off, &v) == 3)
+            for (int k = 0; k < n; ++k) {
+                bool match = strcmp(cls, "*") == 0 || strcmp(cls, list[k].name) == 0 ||
+                             (cls[0] == '#' && atoi(cls + 1) == list[k].index);
+                if (!match)
+                    continue;
+                ++hit;
+                if (set) {
+                    logf("bridge: eset #%d %s +%X %.1f -> %.1f", list[k].index, list[k].name, off,
+                         game::at<float>(list[k].ptr, off), v);
+                    *reinterpret_cast<float *>(list[k].ptr + off) = v;
+                } else {
+                    logf("bridge: ewatch #%d %s +%X", list[k].index, list[k].name, off);
+                    watch_start(list[k].ptr + off, long(v), list[k].ptr);
+                    break;
+                }
+            }
+        _snprintf(g_current, sizeof g_current, "%s %s +%X (%d enemies)", set ? "eset" : "ewatch", cls, off, hit);
+    } else if (strncmp(line, "ptrscan ", 8) == 0) {
+        char who[16] = {};
+        float v = 0.f;
+        uintptr_t obj = 0;
+        if (sscanf(line + 8, "%15s %f", who, &v) == 2) {
+            if (strcmp(who, "pawn") == 0)
+                obj = possess_main_pawn();
+            else if (strcmp(who, "arisen") == 0)
+                obj = possess_arisen();
+            else if (who[0] == '#') {
+                EnemySlot list[128];
+                int n = enemies_snapshot(list, 128);
+                for (int k = 0; k < n; ++k)
+                    if (list[k].index == atoi(who + 1))
+                        obj = list[k].ptr;
+            }
+        }
+        int hits = 0;
+        auto close_to = [v](float f) { return f >= v - 1.f && f <= v + 1.f; };
+        for (uintptr_t o = 0; obj && o < 0x7000 && hits < 40 && mem_readable((void *)(obj + o), 4); o += 4) {
+            if (close_to(game::at<float>(obj, o)) && ++hits)
+                logf("bridge: ptrscan %s +0x%X = %.2f", who, unsigned(o), game::at<float>(obj, o));
+            uintptr_t p = game::at<uintptr_t>(obj, o);
+            if (p < 0x10000 || (p & 3) || !mem_readable((void *)p, 0x1000))
+                continue;
+            for (uintptr_t q = 0; q < 0x1000 && hits < 40; q += 4)
+                if (close_to(game::at<float>(p, q)) && ++hits)
+                    logf("bridge: ptrscan %s [+0x%X] %p (vt %08X) +0x%X = %.2f", who, unsigned(o), (void *)p,
+                         unsigned(game::at<uintptr_t>(p, 0)), unsigned(q), game::at<float>(p, q));
+        }
+        _snprintf(g_current, sizeof g_current, "ptrscan %s (%d hits)", who, hits);
+    } else if (strncmp(line, "vtref ", 6) == 0) {
+        unsigned vt = 0;
+        uintptr_t a = possess_arisen();
+        int hits = 0;
+        if (sscanf(line + 6, "%x", &vt) == 1 && a) {
+            auto show = [&](uintptr_t obj, const char *path) {
+                ++hits;
+                logf("bridge: vtref %08X at %p via %s", vt, (void *)obj, path);
+                for (uintptr_t f = 4; f < 0x200; f += 4) {
+                    uintptr_t v = game::at<uintptr_t>(obj, f);
+                    if (v < 0x10000 || (v & 3) || !mem_readable((void *)v, 8))
+                        continue;
+                    uintptr_t fvt = game::at<uintptr_t>(v, 0);
+                    if (fvt >= 0x00401000 && fvt < 0x01700000)
+                        logf("bridge: vtref   +0x%X -> %p %s%s", unsigned(f), (void *)v, enemies_class_of(v),
+                             v == a ? " (the Arisen)" : "");
+                }
+            };
+            char path[32];
+            for (uintptr_t o = 0; o < 0x8000 && hits < 8 && mem_readable((void *)(a + o), 4); o += 4) {
+                uintptr_t p = game::at<uintptr_t>(a, o);
+                if (p < 0x10000 || (p & 3) || !mem_readable((void *)p, 0x200))
+                    continue;
+                if (game::at<uintptr_t>(p, 0) == vt) {
+                    _snprintf(path, sizeof path, "+0x%X", unsigned(o));
+                    show(p, path);
+                    continue;
+                }
+                uintptr_t pvt = game::at<uintptr_t>(p, 0);
+                if (pvt < 0x00401000 || pvt > 0x01700000)
+                    continue;
+                for (uintptr_t q = 0; q < 0x200 && hits < 8; q += 4) {
+                    uintptr_t r = game::at<uintptr_t>(p, q);
+                    if (r >= 0x10000 && !(r & 3) && mem_readable((void *)r, 0x200) && game::at<uintptr_t>(r, 0) == vt) {
+                        _snprintf(path, sizeof path, "[+0x%X]+0x%X", unsigned(o), unsigned(q));
+                        show(r, path);
+                    }
+                }
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "vtref (%d)", hits);
+    } else if (strncmp(line, "npcref", 6) == 0) {
+        char tag[16] = "-";
+        sscanf(line + 6, "%15s", tag);
+        uintptr_t npcs[64], a = possess_arisen();
+        int n = probe_npcs(npcs, 64), hits = 0;
+        float ax = 0, az = 0;
+        position(a, ax, az);
+        for (int k = 0; k < n && a; ++k) {
+            float x, z;
+            position(npcs[k], x, z);
+            if ((x - ax) * (x - ax) + (z - az) * (z - az) > 600.f * 600.f)
+                continue;
+            logf("bridge: npcref %s npc %p %s at %.0f u", tag, (void *)npcs[k], enemies_class_of(npcs[k]),
+                 std::sqrt((x - ax) * (x - ax) + (z - az) * (z - az)));
+            for (uintptr_t o = 0; o < 0x8000 && hits < 60 && mem_readable((void *)(npcs[k] + o), 4); o += 4) {
+                uintptr_t p = game::at<uintptr_t>(npcs[k], o);
+                if (p == a && ++hits)
+                    logf("bridge: npcref %s npc %p +0x%X -> arisen", tag, (void *)npcs[k], unsigned(o));
+                if (p < 0x10000 || (p & 3) || p == a || !mem_readable((void *)p, 0x400))
+                    continue;
+                uintptr_t vt = game::at<uintptr_t>(p, 0);
+                if (vt < 0x00401000 || vt > 0x01700000)
+                    continue;
+                for (uintptr_t q = 0; q < 0x400 && hits < 60; q += 4)
+                    if (game::at<uintptr_t>(p, q) == a && ++hits)
+                        logf("bridge: npcref %s npc %p [+0x%X] %p (vt %08X) +0x%X -> arisen", tag, (void *)npcs[k], unsigned(o),
+                             (void *)p, unsigned(vt), unsigned(q));
+            }
+            for (uintptr_t o = 0; o < 0x8000 && hits < 60 && mem_readable((void *)(a + o), 4); o += 4) {
+                uintptr_t p = game::at<uintptr_t>(a, o);
+                if (p == npcs[k] && ++hits)
+                    logf("bridge: npcref %s arisen +0x%X -> npc %p", tag, unsigned(o), (void *)npcs[k]);
+                if (p < 0x10000 || (p & 3) || p == npcs[k] || !mem_readable((void *)p, 0x400) ||
+                    game::at<uintptr_t>(p, 0) < 0x00401000 || game::at<uintptr_t>(p, 0) > 0x01700000)
+                    continue;
+                for (uintptr_t q = 0; q < 0x400 && hits < 60; q += 4)
+                    if (game::at<uintptr_t>(p, q) == npcs[k] && ++hits)
+                        logf("bridge: npcref %s arisen [+0x%X] %p (vt %08X) +0x%X -> npc %p", tag, unsigned(o), (void *)p,
+                             unsigned(game::at<uintptr_t>(p, 0)), unsigned(q), (void *)npcs[k]);
+            }
+        }
+        uintptr_t gm = game::at<uintptr_t>(game::kGameMain, 0);
+        logf("bridge: npcref %s done: event state %d, %d hits", tag, gm ? game::at<int32_t>(gm, game::kGsEvent) : -1, hits);
+        _snprintf(g_current, sizeof g_current, "npcref %s (%d hits)", tag, hits);
+    } else if (strncmp(line, "netstart", 8) == 0) {
+        static bool started = false;
+        if (!started && cfg_role() != NET_OFF) {
+            started = true;
+            net_start(cfg_role(), cfg_peer(), cfg_port());
+        }
+        strcpy(g_current, "netstart");
+    } else if (strncmp(line, "nlist", 5) == 0) {
+        uintptr_t npcs[64];
+        int n = probe_npcs(npcs, 64);
+        float ax = 0, az = 0;
+        position(possess_arisen(), ax, az);
+        for (int a = 0; a < n; ++a)
+            for (int b = a + 1; b < n; ++b) {
+                float xa, za, xb, zb;
+                position(npcs[a], xa, za);
+                position(npcs[b], xb, zb);
+                if ((xb - ax) * (xb - ax) + (zb - az) * (zb - az) < (xa - ax) * (xa - ax) + (za - az) * (za - az))
+                    std::swap(npcs[a], npcs[b]);
+            }
+        for (int k = 0; k < n && k < 12; ++k) {
+            float x, z;
+            position(npcs[k], x, z);
+            logf("bridge: nlist #%d npc %p at (%.0f, %.0f), %.0f u away", k, (void *)npcs[k], x, z,
+                 std::sqrt((x - ax) * (x - ax) + (z - az) * (z - az)));
+        }
+        _snprintf(g_current, sizeof g_current, "nlist (%d)", n);
+    } else if (sscanf(line, "ngoto #%u %f %u", &slot, &r, &timeout) == 3) {
+        uintptr_t npcs[64];
+        int n = probe_npcs(npcs, 64);
+        float ax = 0, az = 0, best = 1e30f;
+        position(possess_arisen(), ax, az);
+        uintptr_t pick = 0;
+        for (unsigned rank = 0; rank <= slot; ++rank) {
+            pick = 0;
+            best = 1e30f;
+            for (int k = 0; k < n; ++k) {
+                float x, z;
+                position(npcs[k], x, z);
+                float d = (x - ax) * (x - ax) + (z - az) * (z - az);
+                if (npcs[k] && d < best) {
+                    best = d;
+                    pick = npcs[k];
+                }
+            }
+            if (rank < slot)
+                for (int k = 0; k < n; ++k)
+                    if (npcs[k] == pick)
+                        npcs[k] = 0;
+        }
+        if (pick) {
+            position(pick, x, z);
+            goto_start(x, z, r, timeout, false);
+            logf("bridge: ngoto #%u npc %p at (%.0f, %.0f)", slot, (void *)pick, x, z);
+        }
+        _snprintf(g_current, sizeof g_current, "ngoto #%u", slot);
+    } else if (sscanf(line, "camto %u", &slot) == 1) {
+        int n = slot < unsigned(kPawns) ? camera_follow(possess_arisen(), possess_pawn_ptr(int(slot))) : 0;
+        logf("bridge: camto %u: %d camera references moved", slot, n);
+        _snprintf(g_current, sizeof g_current, "camto %u", slot);
+    } else if (strncmp(line, "codectest", 9) == 0) {
+        std::vector<uint8_t> file, packed;
+        uint32_t version = 0, head[8], head2[8];
+        std::string xml, ch, xml2, ch2;
+        DWORD t0 = GetTickCount();
+        bool ok = storage_own_save(file, version) && save_unpack(file, xml, head);
+        DWORD t1 = GetTickCount();
+        ok = ok && save_character(xml, -1, ch) && save_put_character(xml, 1, ch);
+        DWORD t2 = GetTickCount();
+        ok = ok && save_pack(xml, head, packed);
+        DWORD t3 = GetTickCount();
+        ok = ok && save_unpack(packed, xml2, head2) && xml2 == xml && save_character(xml2, 1, ch2) && ch2 == ch;
+        logf("bridge: codectest %s: save v%u, xml %u bytes, character \"%s\" %u bytes, packed %u bytes; unpack %lu ms, "
+             "merge %lu ms, pack %lu ms", ok ? "OK" : "FAILED", version, unsigned(xml.size()),
+             save_character_name(ch).c_str(), unsigned(ch.size()), ok ? head2[2] : 0u, t1 - t0, t2 - t1, t3 - t2);
+        if (ok)
+            if (FILE *f = fopen("codec_out.sav", "wb")) {
+                fwrite(packed.data(), 1, packed.size(), f);
+                fclose(f);
+            }
+        strcpy(g_current, "codectest");
+    } else if (sscanf(line, "cutplay %u", &slot) == 1) {
+        cutscene_play(int(slot));
+        _snprintf(g_current, sizeof g_current, "cutplay %u", slot);
+    } else if (strncmp(line, "pfind", 5) == 0) {
+        uintptr_t a = possess_arisen();
+        uintptr_t prm = a ? game::at<uintptr_t>(a, 0x3DEC) : 0;
+        if (prm && mem_readable(reinterpret_cast<void *>(prm), 0x1000)) {
+            for (int off = 0; off < 0x1000; off += 32) {
+                char hex[32 * 3 + 1];
+                for (int j = 0; j < 32; ++j)
+                    snprintf(hex + j * 3, 4, "%02X ", game::at<uint8_t>(prm, off + j));
+                logf("bridge: pfind +%03X %s", off, hex);
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "pfind");
+    } else if (strncmp(line, "placename", 9) == 0) {
+        placename_scan();
+        _snprintf(g_current, sizeof g_current, "placename");
+    } else if (strncmp(line, "objpush ", 8) == 0) {
+        float dx = 0.f, dz = 0.f;
+        if (sscanf(line + 8, "%f %f", &dx, &dz) == 2)
+            objects_debug("push", dx, dz);
+        _snprintf(g_current, sizeof g_current, "objpush");
+    } else if (strncmp(line, "objnear", 7) == 0) {
+        objects_debug("near", 0.f, 0.f);
+        _snprintf(g_current, sizeof g_current, "objnear");
+    } else if (strncmp(line, "units", 5) == 0) {
+        units_scan();
+        _snprintf(g_current, sizeof g_current, "units");
+    } else if (strncmp(line, "setinfo", 7) == 0) {
+        enemies_setinfo_scan();
+        _snprintf(g_current, sizeof g_current, "setinfo");
+    } else if (strncmp(line, "where", 5) == 0) {
+        if (uintptr_t a = possess_arisen())
+            logf("bridge: where %.0f %.0f %.0f", game::at<float>(a, 0x40), game::at<float>(a, 0x44), game::at<float>(a, 0x48));
+        float fox, foz;
+        field_origin_scan();
+        bool known = field_origin(fox, foz);
+        logf("bridge: where origin (%.0f, %.0f)%s", fox, foz, known ? "" : ": none found");
+        _snprintf(g_current, sizeof g_current, "where");
+    } else if (strncmp(line, "partyhp", 7) == 0) {
+        const float *a = enemies_hp(possess_arisen());
+        logf("bridge: partyhp arisen %.1f/%.1f", a ? a[0] : -1.f, a ? a[1] : -1.f);
+        for (int p = 0; p < kPawns; ++p) {
+            const float *h = possess_pawn_ptr(p) ? enemies_hp(possess_pawn_ptr(p)) : nullptr;
+            logf("bridge: partyhp pawn %d %.1f/%.1f", p, h ? h[0] : -1.f, h ? h[1] : -1.f);
+        }
+        strcpy(g_current, "partyhp");
+    } else if (strncmp(line, "partyname ", 10) == 0) {
+        std::vector<std::string> names;
+        char buf[200];
+        strncpy(buf, line + 10, sizeof buf - 1);
+        buf[sizeof buf - 1] = 0;
+        for (char *t = strtok(buf, " "); t; t = strtok(nullptr, " "))
+            names.push_back(t);
+        for (int m = -1; m < kPawns; ++m) {
+            uintptr_t ch = m < 0 ? possess_arisen() : possess_pawn_ptr(m);
+            std::string found;
+            for (const std::string &n : names) {
+                auto scan = [&](uintptr_t base, size_t len, const char *how) {
+                    while (len > 0x100 && !mem_readable(reinterpret_cast<void *>(base), len))
+                        len /= 2;
+                    const char *b = reinterpret_cast<const char *>(base);
+                    for (size_t o = 0; o + n.size() + 1 < len; ++o) {
+                        if (b[o] == n[0] && memcmp(b + o, n.c_str(), n.size() + 1) == 0) {
+                            char t[96];
+                            _snprintf(t, sizeof t, " %s@%s+0x%X", n.c_str(), how, unsigned(o));
+                            found += t;
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!ch || scan(ch, 0x10000, "ch"))
+                    continue;
+                for (size_t k = 0; k < 0x8000 && mem_readable(reinterpret_cast<void *>(ch), 0x8000); k += 4) {
+                    uintptr_t q = game::at<uintptr_t>(ch, k);
+                    char how[24];
+                    _snprintf(how, sizeof how, "[ch+0x%X]", unsigned(k));
+                    if (q > 0x10000 && q < 0x7FFF0000 && (q & 3) == 0 && mem_readable(reinterpret_cast<void *>(q), 0x400) &&
+                        scan(q, 0x400, how))
+                        break;
+                }
+            }
+            logf("bridge: partyname %s %d:%s", m < 0 ? "arisen" : "pawn", m, found.c_str());
+        }
+        strcpy(g_current, "partyname");
+    } else if (strncmp(line, "pinv ", 5) == 0) {
+        bool on = atoi(line + 5) != 0;
+        uintptr_t a = possess_arisen();
+        float *hp = a ? enemies_hp(a) : nullptr;
+        if (!on && g_arisen_inv && hp)
+            game::at<uint8_t>(reinterpret_cast<uintptr_t>(hp) - 8, 0x30) &= uint8_t(~1u);
+        g_arisen_inv = on;
+        keep_arisen_inv();
+        logf("bridge: pinv %d (Arisen HP entry %s)", int(on), hp ? "found" : "not found yet");
+        _snprintf(g_current, sizeof g_current, "pinv %d", int(on));
+    } else if (strcmp(line, "getup") == 0) {
+        revive_helped();
+        logf("bridge: getup");
+        _snprintf(g_current, sizeof g_current, "getup");
+    } else if (strncmp(line, "php ", 4) == 0) {
+        char who[16] = {};
+        float v = 0.f;
+        if (sscanf(line + 4, "%15s %f", who, &v) == 2) {
+            uintptr_t ch = strcmp(who, "pawn") == 0 ? possess_main_pawn() : possess_arisen();
+            if (float *hp = ch ? enemies_hp(ch) : nullptr) {
+                logf("bridge: php %s HP %.1f -> %.1f (max %.1f)", who, hp[0], v, hp[1]);
+                hp[0] = v;
+            }
+        }
+        _snprintf(g_current, sizeof g_current, "php %s", who);
+    } else if (sscanf(line, "pawnkill %u", &slot) == 1) {
+        enemies_queue_pawn_kill(int(slot));
+        _snprintf(g_current, sizeof g_current, "pawnkill %u", slot);
+    } else if (strncmp(line, "pkill", 5) == 0) {
+        enemies_queue_arisen_kill();
+        strcpy(g_current, "pkill");
+    } else if (strncmp(line, "pdmg ", 5) == 0) {
+        float v = 0.f;
+        if (sscanf(line + 5, "%f", &v) == 1)
+            enemies_queue_arisen_damage(v);
+        _snprintf(g_current, sizeof g_current, "pdmg %.0f", v);
+    } else if (strncmp(line, "findvt ", 7) == 0) {
+        unsigned vt = 0;
+        int hits = 0;
+        if (sscanf(line + 7, "%x", &vt) == 1)
+            for (uintptr_t g = 0x01621000; g < 0x019AB1E0 && hits < 20; g += 4) {
+                uintptr_t obj = game::at<uintptr_t>(g, 0);
+                if (obj < 0x10000 || (obj & 3) || !mem_readable(reinterpret_cast<void *>(obj), 4))
+                    continue;
+                if (game::at<uintptr_t>(obj, 0) == vt && ++hits)
+                    logf("bridge: findvt %08X: global %08X -> %08X", vt, unsigned(g), unsigned(obj));
+            }
+        _snprintf(g_current, sizeof g_current, "findvt (%d)", hits);
+    } else if (strncmp(line, "dumpg ", 6) == 0) {
+        unsigned g = 0, size = 0, off = 0;
+        char name[64] = {};
+        int nargs = sscanf(line + 6, "%x %x %63s %x", &g, &size, name, &off);
+        if (nargs >= 3) {
+            uintptr_t obj = game::at<uintptr_t>(g, 0);
+            if (nargs == 4 && obj)
+                obj = game::at<uintptr_t>(obj, off);
+            while (size > 0x100 && !mem_readable(reinterpret_cast<void *>(obj), size))
+                size -= 0x100;
+            char path[128];
+            _snprintf(path, sizeof path, "dumpg_%s.bin", name);
+            if (obj && mem_readable(reinterpret_cast<void *>(obj), size))
+                if (FILE *f = fopen(path, "wb")) {
+                    fwrite(reinterpret_cast<const void *>(obj), 1, size, f);
+                    fclose(f);
+                }
+            logf("bridge: dumpg %08X -> %08X, %X bytes as %s", g, unsigned(obj), size, path);
+        }
+        _snprintf(g_current, sizeof g_current, "dumpg %s", name);
+    } else if (sscanf(line, "gsflag %u", &ms) == 1 && ms < 64) {
+        if (uintptr_t gs = game::at<uintptr_t>(game::kGameMain, 0))
+            InterlockedOr(reinterpret_cast<volatile LONG *>(gs + 0xB8840 + ms / 32 * 4), LONG(1u << (ms % 32)));
+        _snprintf(g_current, sizeof g_current, "gsflag %u", ms);
+    } else if (strncmp(line, "quietsave", 9) == 0) {
+        actions_quiet_save();
+        strcpy(g_current, "quietsave");
+    } else if (strncmp(line, "savereq ", 8) == 0) {
+        unsigned mode = 0, slot = 0;
+        uintptr_t sm = game::at<uintptr_t>(game::va(0x018FA518), 0);
+        if (sscanf(line + 8, "%x %u", &mode, &slot) == 2 && sm && game::at<uint8_t>(sm, 0x648) == 0) {
+            game::at<int32_t>(sm, 0xA44) = -1;
+            game::at<int32_t>(sm, 0xA48) = -1;
+            game::at<uint8_t>(sm, 0x638) = uint8_t(slot);
+            game::at<uint8_t>(sm, 0x63B) = 1;
+            game::at<int32_t>(sm, 0xA4C) = 0;
+            game::at<int32_t>(sm, 0xA50) = 0;
+            game::at<uint8_t>(sm, 0x829) = 1;
+            game::at<uint8_t>(sm, 0x64D) = 0;
+            game::at<uint8_t>(sm, 0x82A) = mode == 0x12;
+            game::at<uint8_t>(sm, 0x649) = 0;
+            MemoryBarrier();
+            game::at<uint8_t>(sm, 0x648) = uint8_t(mode);
+            logf("bridge: savereq mode %X slot %u sent to %08X", mode, slot, unsigned(sm));
+        } else {
+            logf("bridge: savereq refused (machine %08X busy or bad args)", unsigned(sm));
+        }
+        _snprintf(g_current, sizeof g_current, "savereq");
+    } else if (strncmp(line, "ifstage ", 8) == 0) {
+        int st = -1;
+        unsigned n = 0, skipped = 0;
+        if (sscanf(line + 8, "%d skip %u", &st, &n) == 2 && net_my_stage() == st)
+            for (; skipped < n && (g_qhead + 1) % 256 != g_qtail; ++skipped)
+                g_qhead = (g_qhead + 1) % 256;
+        logf("bridge: ifstage %d (here %d): %u line(s) skipped", st, int(net_my_stage()), skipped);
+        _snprintf(g_current, sizeof g_current, "ifstage %d", st);
+    } else if (sscanf(line, "waitclock %u", &ms) == 1 && ms > 0) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        uint64_t now_ms = ((uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) / 10000;
+        unsigned period = ms * 1000, left = period - unsigned(now_ms % period);
+        g_busy_until = GetTickCount() + left;
+        _snprintf(g_current, sizeof g_current, "waitclock %u s (%u ms)", ms, left);
+    } else if (sscanf(line, "wait %u", &ms) == 1) {
+        g_busy_until = GetTickCount() + ms;
+        _snprintf(g_current, sizeof g_current, "wait %u ms", ms);
+    } else if (strncmp(line, "stop", 4) == 0) {
+        g_qhead = g_qtail = 0;
+        g_busy_until = 0;
+        g_goto.active = false;
+        pads_override(0, XINPUT_GAMEPAD{}, 0);
+        strcpy(g_current, "idle");
+    } else {
+        logf("bridge: unknown command: %s", line);
+        return;
+    }
+    logf("bridge: %s", line);
+}
+
+void poll_input()
+{
+    FILE *f = fopen("bridge_in.txt", "r");
+    if (!f)
+        return;
+    char line[256];
+    long n = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (++n <= g_lines_done)
+            continue;
+        line[strcspn(line, "\r\n")] = 0;
+        g_lines_done = n;
+        if (!line[0] || line[0] == '#')
+            continue;
+        if (strncmp(line, "stop", 4) == 0) {
+            run_line(line);
+            continue;
+        }
+        if ((g_qtail + 1) % 256 != g_qhead) {
+            strncpy(g_queue[g_qtail], line, 127);
+            g_queue[g_qtail][127] = 0;
+            g_qtail = (g_qtail + 1) % 256;
+        }
+    }
+    fclose(f);
+}
+
+void steer()
+{
+    if (!g_goto.active)
+        return;
+    float ax, az, fx, fz;
+    if (!position(possess_arisen(), ax, az) || !camera_forward(fx, fz))
+        return;
+    float wp[3] = {ax, 0.f, az};
+    field_to_world(wp);
+    ax = wp[0];
+    az = wp[2];
+    float dx = g_goto.x - ax, dz = g_goto.z - az, d = std::sqrt(dx * dx + dz * dz);
+    if (d <= g_goto.radius || GetTickCount() > g_goto.until) {
+        logf("bridge: goto %s at (%.0f, %.0f), %.0f u from target", d <= g_goto.radius ? "reached" : "TIMEOUT", ax, az, d);
+        g_goto.active = false;
+        pads_override(0, XINPUT_GAMEPAD{}, 0);
+        strcpy(g_current, d <= g_goto.radius ? "goto reached" : "goto timeout");
+        return;
+    }
+    dx /= d;
+    dz /= d;
+    DWORD now = GetTickCount();
+    if (int(now - g_goto.check_at) >= 0) {
+        float moved = std::sqrt((ax - g_goto.last_x) * (ax - g_goto.last_x) + (az - g_goto.last_z) * (az - g_goto.last_z));
+        if (moved < 20) {
+            g_goto.offset_deg = kTryOffsets[g_goto.attempt++ % (sizeof kTryOffsets / sizeof kTryOffsets[0])];
+            g_goto.hold_until = now + 1500;
+            logf("bridge: stuck at (%.0f, %.0f), trying %+.0f deg", ax, az, g_goto.offset_deg);
+        } else if (!g_goto.hold_until || int(now - g_goto.hold_until) >= 0) {
+            g_goto.offset_deg *= 0.5f;
+            if (std::fabs(g_goto.offset_deg) < 5)
+                g_goto.offset_deg = 0, g_goto.attempt = 0;
+        }
+        logf("bridge: at %.0f %.0f", ax, az);
+        g_goto.last_x = ax;
+        g_goto.last_z = az;
+        g_goto.check_at = now + 600;
+    }
+    if (g_goto.offset_deg != 0) {
+        float a = g_goto.offset_deg * 3.14159265f / 180, c = std::cos(a), s_ = std::sin(a);
+        float nx = dx * c - dz * s_, nz = dx * s_ + dz * c;
+        dx = nx;
+        dz = nz;
+    }
+    float s = float(possess_bridge_sign());
+    float rxv = -fz * s, rzv = fx * s;
+    float sy = dx * fx + dz * fz;
+    float sx = dx * rxv + dz * rzv;
+    XINPUT_GAMEPAD g = {};
+    g.sThumbLX = SHORT(sx * 30000);
+    g.sThumbLY = SHORT(sy * 30000);
+    pads_override(0, g, GetTickCount() + 200);
+}
+
+void watch_save_machine()
+{
+    static uint32_t last = 0xFFFFFFFF;
+    uintptr_t sm = game::at<uintptr_t>(game::va(0x018FA518), 0);
+    if (!sm || !mem_readable(reinterpret_cast<void *>(sm + 0x638), 0x20))
+        return;
+    uint32_t now = game::at<uint8_t>(sm, 0x648) | game::at<uint8_t>(sm, 0x649) << 8 | game::at<uint8_t>(sm, 0x638) << 16;
+    if (now != last)
+        logf("bridge: save machine mode %X state %X slot %u", now & 0xFF, now >> 8 & 0xFF, now >> 16);
+    last = now;
+}
+
+void write_status()
+{
+    FILE *f = fopen("bridge_out.txt.tmp", "w");
+    if (!f)
+        return;
+    float ax = 0, az = 0, px = 0, pz = 0, fx = 0, fz = 0;
+    bool a = position(possess_arisen(), ax, az), p = position(possess_main_pawn(), px, pz), c = camera_forward(fx, fz);
+    fprintf(f, "tick %lu\narisen %s %.1f %.1f\npawn %s %.1f %.1f\ncamera_fwd %s %.3f %.3f\ncommand %s\nlines_done %ld\nqueued %d\n",
+            GetTickCount(), a ? "ok" : "none", ax, az, p ? "ok" : "none", px, pz, c ? "ok" : "none", fx, fz, g_current,
+            g_lines_done, (g_qtail - g_qhead + 256) % 256);
+    fclose(f);
+    MoveFileExA("bridge_out.txt.tmp", "bridge_out.txt", MOVEFILE_REPLACE_EXISTING);
+}
+
+DWORD WINAPI bridge_thread(LPVOID)
+{
+    logf("bridge: listening on bridge_in.txt");
+    for (;;) {
+        poll_input();
+        bool busy = g_busy_until && int(GetTickCount() - g_busy_until) < 0;
+        if (!g_goto.active && !busy && g_qhead != g_qtail) {
+            run_line(g_queue[g_qhead]);
+            g_qhead = (g_qhead + 1) % 256;
+        }
+        steer();
+        keep_arisen_inv();
+        watch_save_machine();
+        write_status();
+        Sleep(50);
+    }
+}
+
+}
+
+static void log_heights()
+{
+    static int on = -1;
+    if (on < 0)
+        on = early_flag("test_log_heights") ? 1 : 0;
+    static DWORD next = 0;
+    DWORD t = GetTickCount();
+    if (!on || (next && int(t - next) < 0))
+        return;
+    next = (t + 100) | 1;
+    char buf[768];
+    int n = _snprintf(buf, sizeof buf, "heights: stage %d", int(net_my_stage()));
+    for (int k = -1; k < kPawns && n > 0 && n < int(sizeof buf) - 160; ++k) {
+        uintptr_t ch = k < 0 ? possess_arisen() : possess_pawn_ptr(k);
+        if (!ch) {
+            n += _snprintf(buf + n, sizeof buf - n, " | %s -", k < 0 ? "A" : "p");
+            continue;
+        }
+        float w[3];
+        world_pos(ch, w);
+        n += _snprintf(buf + n, sizeof buf - n, " | %s%d%s%s (%.0f, %.0f, %.0f) %s", k < 0 ? "A" : "p", k < 0 ? 0 : k,
+                       k >= 0 && net_puppet(1 + k) ? "*" : "", holder_of(ch) ? "^" : "", w[0], w[1], w[2], action_name(ch));
+    }
+    logf("%s", buf);
+}
+
+void bridge_game_tick()
+{
+    log_heights();
+    if (g_poke_until) {
+        if (int(GetTickCount() - g_poke_until) >= 0)
+            g_poke_until = 0;
+        else
+            game::at<uint32_t>(g_poke_addr, 0) = g_poke_val;
+    }
+    LONG who = InterlockedExchange(&g_rebuild_who, -2);
+    if (who < -1 || who >= kPawns)
+        return;
+    uintptr_t ch = who < 0 ? possess_arisen() : possess_pawn_ptr(who);
+    if (!ch || !game::at<uintptr_t>(ch, 0x3DEC))
+        return;
+    using Rebuild_t = void(__fastcall *)(uintptr_t);
+    reinterpret_cast<Rebuild_t>(game::va(0x00B5CE10))(ch);
+    logf("bridge: rebuild %d (%p) done", int(who), (void *)ch);
+}
+
+void bridge_start()
+{
+    DeleteFileA("bridge_in.txt");
+    if (HANDLE t = CreateThread(nullptr, 0, bridge_thread, nullptr, 0, nullptr))
+        CloseHandle(t);
+}

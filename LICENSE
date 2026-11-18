@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 NLRI
+Copyright (c) 2026 clepix21 (DDDA Coop, the core of this mod up to its version 0.11.0)
+Copyright (c) 2026 NLRI (Arisen Together)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +20,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This licence covers the mod's own code and files, the launcher's icon (the
+wakestone, drawn by tools/make_icon.ps1) included. It does not cover MinHook (its
+own licence is in dist/LICENCES.txt). Dragon's Dogma: Dark Arisen © Capcom.
