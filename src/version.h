@@ -1,2 +1,2 @@
 #pragma once
-#define DDDA_COOP_VERSION "0.12.0"
+#define DDDA_COOP_VERSION "0.13.0"

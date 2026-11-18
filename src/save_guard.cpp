@@ -314,7 +314,8 @@ int32_t __attribute__((thiscall)) hk_file_read(void *self, const char *name, voi
             return n;
         }
     }
-    if (is_save(name) && cfg_role() == NET_GUEST && !saving() && !storage_guest_refused() && machine_mode() != 0 && machine_mode() != 6) {
+    if (is_save(name) && cfg_role() == NET_GUEST && net_role() == NET_GUEST && !saving() && !storage_guest_refused() &&
+        machine_mode() != 0 && machine_mode() != 6) {
         EnterCriticalSection(&g_save_lock);
         bool have = !g_peer_save.empty() || !g_roam_save.empty();
         LeaveCriticalSection(&g_save_lock);

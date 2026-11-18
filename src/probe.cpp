@@ -117,6 +117,8 @@ void __fastcall hk_update(uintptr_t ch)
         if (idx >= 0)
             net_host_record(ch, idx);
     }
+    if (net_role() != NET_OFF && enemies_npc_kind(ch) == ENEMY_HUMAN)
+        net_human_commands(ch);
     if (game::at<uintptr_t>(ch, 0) == game::kVtNpc)
         note_npc(ch);
     if (!cfg_debug_log())

@@ -91,6 +91,7 @@ struct Unit {
     uintptr_t ch;
     uint32_t starts;
     DWORD last_start;
+    DWORD started;
     bool ours;
     bool driven;
     int follow;
@@ -148,6 +149,15 @@ uint32_t emact_starts(uintptr_t ch)
     UnitsLock lock;
     Unit *u = unit_of(ch, false);
     return u ? u->starts : 0;
+}
+
+uint32_t emact_running(uintptr_t ch, DWORD *since)
+{
+    uint32_t act = game::at<uint32_t>(ch, 0x2DD4);
+    UnitsLock lock;
+    Unit *u = unit_of(ch, false);
+    *since = u ? u->started : 0;
+    return act;
 }
 
 int g_think_mode = 1;
@@ -448,6 +458,7 @@ extern "C" void __cdecl emact_before(uintptr_t mgr)
     uint32_t cur = game::at<uint32_t>(mgr, 0x1C), req = game::at<uint32_t>(mgr, 0x20);
     if (!is_actor(ch))
         return;
+    bool again = false;
     if (g_host_ai) {
         UnitsLock lock;
         Unit *u = unit_of(ch, true);
@@ -456,6 +467,8 @@ extern "C" void __cdecl emact_before(uintptr_t mgr)
         u->last_start = now;
         if (fresh) {
             ++u->starts;
+            u->started = now | 1;
+            again = req == cur;
             u->gv = u->grab_victim && int(now - u->grab_at) < 200 ? u->grab_victim : 0;
             u->gd = u->gv ? u->grab_dti : 0;
             u->grab_victim = 0;
@@ -470,7 +483,7 @@ extern "C" void __cdecl emact_before(uintptr_t mgr)
             }
         }
     }
-    if (!g_log || cur == req || !may_log())
+    if (!g_log || (cur == req && !again) || !may_log())
         return;
     char id[40];
     id_text(ch, id, sizeof id);
@@ -480,13 +493,14 @@ extern "C" void __cdecl emact_before(uintptr_t mgr)
         const int32_t *s = reinterpret_cast<const int32_t *>(mgr + 0x44);
         const float *f = reinterpret_cast<const float *>(mgr + 0x54);
         logf("emact: %s %s %p change 0x%X %s -> 0x%X %s at (%.0f, %.0f, %.0f) ex u[%X %X %X %X] s[%d %d %d %d] "
-             "f[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f]",
+             "f[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f]%s",
              enemies_class_of(ch), id, (void *)ch, cur, obj_class(game::at<uintptr_t>(mgr, 0x10)), req, act_class(mgr, req),
              pos[0], pos[1], pos[2], u[0], u[1], u[2], u[3], s[0], s[1], s[2], s[3], f[0], f[1], f[2], f[3], f[4], f[5],
-             f[6], f[7]);
+             f[6], f[7], again ? " (again)" : "");
     } else {
-        logf("emact: %s %s %p change 0x%X %s -> 0x%X %s at (%.0f, %.0f, %.0f)", enemies_class_of(ch), id, (void *)ch, cur,
-             obj_class(game::at<uintptr_t>(mgr, 0x10)), req, act_class(mgr, req), pos[0], pos[1], pos[2]);
+        logf("emact: %s %s %p change 0x%X %s -> 0x%X %s at (%.0f, %.0f, %.0f)%s", enemies_class_of(ch), id, (void *)ch, cur,
+             obj_class(game::at<uintptr_t>(mgr, 0x10)), req, act_class(mgr, req), pos[0], pos[1], pos[2],
+             again ? " (again)" : "");
     }
 }
 

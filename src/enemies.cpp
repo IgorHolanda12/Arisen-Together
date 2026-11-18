@@ -1492,6 +1492,16 @@ void __fastcall hk_death(uintptr_t ch, void *edx, uint32_t a, uint32_t hit)
     LeaveCriticalSection(&g_lock);
 }
 
+int enemies_slot_of(uintptr_t ch)
+{
+    if (!g_ready || !ch)
+        return -1;
+    for (int i = 0; i < kMax; ++i)
+        if (g_slots[i].ptr == ch)
+            return i;
+    return -1;
+}
+
 int enemies_snapshot(EnemySlot *out, int cap)
 {
     if (!g_ready)

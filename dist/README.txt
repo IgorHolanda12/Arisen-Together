@@ -1,12 +1,13 @@
-Arisen Together 0.12.0 (alpha) - online co-op for Dragon's Dogma: Dark Arisen (Steam or GOG, 2 to 4 players)
+Arisen Together 0.13.0 (alpha) - online co-op for Dragon's Dogma: Dark Arisen (Steam or GOG, 2 to 4 players)
 ===============================================================================================================
 
 Each player needs the game (Steam or GOG, current version) on their own PC, and this same mod
-version (0.12.0).
+version (0.13.0).
 - Steam: guests must be Steam friends with the host. No IP address or port to set.
 - GOG: players join by IP address (direct IP, UDP port 27101). See "GOG and direct IP" below.
 
-Arisen Together does not play with DDDA Coop: every player needs Arisen Together 0.12.0.
+Arisen Together does not play with DDDA Coop, nor with its own 0.12.0: every player needs
+Arisen Together 0.13.0. With "Update automatically" on (Settings), the launcher installs it by itself.
 
 Files: ArisenTogether.exe (the launcher), dinput8.dll (the mod), coop.ini (settings). Keep them
 together, in a folder of their own, not the game folder (the launcher copies what the game needs).
@@ -63,6 +64,15 @@ Good to know
 - If the game folder already has another dinput8.dll (another mod), it is not replaced: remove it first.
   A DDDA Coop dinput8.dll is replaced.
 - The exported log holds your Steam name and Steam ID and your friends': send it only to people you trust.
+
+Arisen Together 0.13.0
+----------------------
+- Bandits and other human foes follow the host's game too. They decide like a pawn, through buttons
+  and sticks: the host's game sends what their AI pressed, and the other games press the same. A blow,
+  a skill or a death that did not follow is started directly. Measured over a simulated connection:
+  95 % of their actions the same in Bitterblack Isle, 88 % at a bandit camp in the open world (about
+  20 % before). The end of an attack, a fall on a slope or an idle pose may still differ for a moment.
+- Not compatible with 0.12.0 (the network format changed).
 
 Arisen Together 0.12.0
 ----------------------

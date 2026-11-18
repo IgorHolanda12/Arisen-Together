@@ -20,7 +20,8 @@ enum MsgType : uint8_t { MSG_INPUT = 1, MSG_SNAP = 2, MSG_ENEMIES = 3, MSG_SAVE_
                        MSG_PROGRESS = 7, MSG_PROGRESS_ACK = 8, MSG_PSTATE = 9, MSG_LOOT = 10, MSG_FLAGS = 11, MSG_REVIVE = 12, MSG_QUEST = 13,
                        MSG_AREA_ENEMIES = 14, MSG_PING = 15, MSG_PONG = 16, MSG_EVENT = 17, MSG_LOTTERY = 18,
                        MSG_LEAD_ENTRIES = 19, MSG_ACT_PARAMS = 20,
-                       MSG_OBJECTS = 21 };
+                       MSG_OBJECTS = 21,
+                       MSG_HUMAN_CMDS = 22 };
 
 constexpr uintptr_t kYawA = 0x2578, kYawB = 0x257C, kYawC = 0x2654;
 constexpr uintptr_t kAimPitch = 0x32D4;
@@ -219,6 +220,24 @@ struct ActParamsMsg {
 };
 constexpr int act_params_size(int count) { return int(offsetof(ActParamsMsg, e) + count * sizeof(ActParams)); }
 static_assert(act_params_size(kActParamsMax) <= 1200, "ACT_PARAMS over 1200 bytes");
+constexpr uintptr_t kHumanCmdFrom = 0x0C, kHumanCmdLen = 0x30;
+struct HumanCmd {
+    uint8_t slot;
+    uint8_t cmd[kHumanCmdLen];
+    float aim;
+    uint32_t press_act;
+    uint16_t press_ms;
+};
+constexpr int kHumanCmdsMax = 20;
+struct HumanCmdsMsg {
+    Header h;
+    int32_t stage;
+    uint8_t from;
+    uint8_t count;
+    HumanCmd e[kHumanCmdsMax];
+};
+constexpr int human_cmds_size(int count) { return int(offsetof(HumanCmdsMsg, e) + count * sizeof(HumanCmd)); }
+static_assert(human_cmds_size(kHumanCmdsMax) <= 1200, "HUMAN_CMDS over 1200 bytes");
 static_assert(sizeof(Header) + 1 + kEnemiesPerPage * sizeof(EnemyState) <= 1200, "ENEMIES page over 1200 bytes");
 static_assert(area_msg_size(kAreaPerPage) <= 1200, "AREA_ENEMIES page over 1200 bytes");
 static_assert(sizeof(SnapMsg) <= 1200, "SNAP over 1200 bytes");
@@ -261,7 +280,7 @@ struct SaveNeedMsg {
 };
 #pragma pack(pop)
 
-constexpr uint32_t kMagic = 0x31475441;
+constexpr uint32_t kMagic = 0x32475441;
 constexpr uint32_t kFamily = 0x00475441, kFamilyUpstream = 0x00434444;
 bool other_version(uint32_t magic) { return ((magic & 0x00FFFFFF) == kFamily || (magic & 0x00FFFFFF) == kFamilyUpstream) && magic != kMagic; }
 volatile LONG g_old_peer = 0;
@@ -1343,6 +1362,18 @@ DWORD g_act_params_tick[kEnemySlots] = {};
 volatile LONG g_act_params_now = 0;
 uint8_t g_enemy_urgent[kEnemySlots] = {};
 HANDLE g_net_wake = nullptr;
+struct HumanCmdState {
+    uint8_t cmd[kHumanCmdLen];
+    float aim;
+    uint32_t press, release;
+    DWORD tick;
+    uint32_t press_act;
+    uint16_t press_ms;
+    DWORD press_rx;
+};
+HumanCmdState g_hc_out[kEnemySlots] = {}, g_hc_in[kEnemySlots] = {};
+volatile LONG g_hc_sent = 0, g_hc_rx = 0, g_hc_applied = 0, g_hc_presses = 0, g_hc_fixed = 0;
+volatile LONG g_hc_now = 0;
 template <class A, class B> bool same_spawn_id(const A &a, const B &b)
 {
     return a.lot_key == b.lot_key && a.lot_id == b.lot_id && a.lot_split == b.lot_split && a.lot_part == b.lot_part;
@@ -2075,6 +2106,43 @@ void receive_all()
                     g_act_params_tick[m->e[e].slot] = now | 1;
                 }
             LeaveCriticalSection(&g_enemy_lock);
+        } else if (h->type == MSG_HUMAN_CMDS && n >= human_cmds_size(0)) {
+            auto m = reinterpret_cast<HumanCmdsMsg *>(buf);
+            int count = m->count;
+            if (count > kHumanCmdsMax || n != human_cmds_size(count))
+                continue;
+            if (g_role == NET_HOST) {
+                m->from = uint8_t(1 + k);
+                for (int q = 0; q < kMaxPeers; ++q)
+                    if (q != k && g_peers[q].used && g_peers[q].pstate_tick && g_peers[q].pstage == m->stage)
+                        send_to(g_peers[q], m, n);
+                continue;
+            } else if (int(m->from) != (g_shared ? int(g_lead) : 0) || (g_shared && m->stage != my_stage())) {
+                continue;
+            }
+            DWORD now = GetTickCount();
+            EnterCriticalSection(&g_enemy_lock);
+            for (int e = 0; e < count; ++e) {
+                const HumanCmd &c = m->e[e];
+                if (c.slot >= kEnemySlots)
+                    continue;
+                HumanCmdState &d = g_hc_in[c.slot];
+                uint32_t p, r;
+                memcpy(&p, c.cmd + (0x2C - kHumanCmdFrom), 4);
+                memcpy(&r, c.cmd + (0x34 - kHumanCmdFrom), 4);
+                memcpy(d.cmd, c.cmd, kHumanCmdLen);
+                d.aim = c.aim;
+                d.press |= p;
+                d.release |= r;
+                d.tick = now | 1;
+                if (p) {
+                    d.press_act = c.press_act;
+                    d.press_ms = c.press_ms;
+                    d.press_rx = now | 1;
+                }
+            }
+            LeaveCriticalSection(&g_enemy_lock);
+            InterlockedExchangeAdd(&g_hc_rx, count);
         } else if (g_role == NET_GUEST && h->type == MSG_ENEMIES && n >= enemies_msg_size(0)) {
             auto m = reinterpret_cast<const EnemiesMsg *>(buf);
             int count = m->count;
@@ -2135,6 +2203,14 @@ void log_enemy_stats(DWORD now)
              "the leader's actions started here",
              fresh, st.applied, st.matched_new, st.unmatched, st.worst_err, st.blocked, st.allowed, st.forced, st.removed,
              st.puppet_blocked, st.felt, st.acted);
+    {
+        LONG sent = InterlockedExchange(&g_hc_sent, 0), rx = InterlockedExchange(&g_hc_rx, 0);
+        LONG applied = InterlockedExchange(&g_hc_applied, 0), presses = InterlockedExchange(&g_hc_presses, 0);
+        LONG fixed = InterlockedExchange(&g_hc_fixed, 0);
+        if (sent || rx || applied)
+            logf("net: human foes' commands: %ld sent, %ld received, written on twins in %ld frames (%ld with presses); %ld "
+                 "blows asked for", sent, rx, applied, presses, fixed);
+    }
     LONG refused = 0, passed = 0, reqs = 0, held = 0, evict = 0, groups = 0, masks = 0;
     net_gate_stats(&refused, &passed);
     enemies_follow_stats(&reqs, &held, &evict, &groups, &masks);
@@ -3055,6 +3131,40 @@ DWORD WINAPI net_thread(LPVOID)
                     if (g_peers[q].used)
                         send_to(g_peers[q], &m, act_params_size(m.count));
         }
+        static DWORD next_hc = 0;
+        if (net_human_cmds_on() && g_role != NET_OFF && lead_self() && (g_role == NET_HOST || g_lead_others) &&
+            (InterlockedExchange(&g_hc_now, 0) || !next_hc || int(now - next_hc) >= 0)) {
+            next_hc = (now + 33) | 1;
+            HumanCmdsMsg m = {};
+            m.h = {kMagic, MSG_HUMAN_CMDS, ++g_seq};
+            m.stage = my_stage();
+            m.from = uint8_t(g_role == NET_HOST ? 0 : net_my_slot());
+            EnterCriticalSection(&g_enemy_lock);
+            for (int k = 0; k < kEnemySlots && m.count < kHumanCmdsMax; ++k) {
+                HumanCmdState &s = g_hc_out[k];
+                if (!s.tick || int(now - s.tick) >= 500)
+                    continue;
+                HumanCmd &c = m.e[m.count++];
+                c.slot = uint8_t(k);
+                memcpy(c.cmd, s.cmd, kHumanCmdLen);
+                memcpy(c.cmd + (0x2C - kHumanCmdFrom), &s.press, 4);
+                memcpy(c.cmd + (0x34 - kHumanCmdFrom), &s.release, 4);
+                c.aim = s.aim;
+                c.press_act = s.press ? s.press_act : 0;
+                c.press_ms = s.press ? s.press_ms : 0xFFFF;
+                s.press = s.release = 0;
+            }
+            LeaveCriticalSection(&g_enemy_lock);
+            if (m.count) {
+                InterlockedExchangeAdd(&g_hc_sent, m.count);
+                if (g_role == NET_GUEST)
+                    send_raw(&m, human_cmds_size(m.count));
+                else
+                    for (int q = 0; q < kMaxPeers; ++q)
+                        if (g_peers[q].used)
+                            send_to(g_peers[q], &m, human_cmds_size(m.count));
+            }
+        }
         static DWORD next_status = 0;
         if (g_shared && (!next_status || int(now - next_status) >= 0)) {
             next_status = (now + 1000) | 1;
@@ -3966,6 +4076,166 @@ void enemy_net_before_action(int i, uintptr_t em)
         follower_actions(f, s, em, i, GetTickCount());
 }
 
+namespace {
+struct HumanFix {
+    DWORD key;
+    int starts;
+    uint32_t act;
+    DWORD at;
+    bool done;
+};
+HumanFix g_hc_fix[kEnemySlots] = {};
+
+void human_fix_blow(uintptr_t ch, int i, int hs, DWORD now)
+{
+    EnterCriticalSection(&g_enemy_lock);
+    EnemyState es = g_enemy_state[hs];
+    DWORD tick = g_enemy_tick[hs];
+    ActParams ap = g_act_params[hs];
+    bool have_ap = g_act_params_tick[hs] != 0;
+    DWORD key = g_follow[i].first_seen ^ (DWORD(hs) << 24);
+    LeaveCriticalSection(&g_enemy_lock);
+    if (!tick || es.act >= 0xFFFFFFFE)
+        return;
+    HumanFix &x = g_hc_fix[i];
+    if (x.key != key) {
+        x = {key, int(es.act_starts), es.act, now | 1, true};
+        return;
+    }
+    if (int(es.act_starts) != x.starts || es.act != x.act) {
+        x.starts = int(es.act_starts);
+        x.act = es.act;
+        x.at = now | 1;
+        x.done = false;
+    }
+    if (x.done || int(now - x.at) < 150)
+        return;
+    x.done = true;
+    const char *cls = emact_act_class(ch, x.act);
+    bool dying = cls && strncmp(cls, "cPlAct", 6) == 0 && (strstr(cls, "Dead") || strstr(cls, "Die"));
+    bool blow = cls && (strncmp(cls, "cPlActWpn", 9) == 0 || strncmp(cls, "cHmEm", 5) == 0 || strncmp(cls, "cNpcAct", 7) == 0 ||
+                        strncmp(cls, "cEventAct", 9) == 0 || dying);
+    if (!blow || emact_context_action(ch, x.act))
+        return;
+    DWORD since = 0;
+    uint32_t run = emact_running(ch, &since);
+    if (run == x.act && since && int(now - since) < 600)
+        return;
+    bool ex = have_ap && ap.act == x.act && ap.starts == uint8_t(x.starts) && (ap.has & 1);
+    if (ex)
+        emact_request_ex(ch, x.act, ap.p);
+    else
+        emact_request(ch, x.act);
+    InterlockedIncrement(&g_hc_fixed);
+    if (emact_logging())
+        logf("emact: human #%d %p: its leader's #%d's %08X %s did not start here in 150 ms (running %08X %s): asked for%s", i,
+             (void *)ch, hs, unsigned(x.act), cls, unsigned(run), emact_act_class(ch, run), ex ? " with its parameters" : "");
+}
+}
+
+bool net_human_cmds_on()
+{
+    static int on = -1;
+    if (on < 0) {
+        char v[8] = "";
+        on = emact_host_ai() && !(cfg_str("host_ai_human_cmds", v, sizeof v) && v[0] == '0') ? 1 : 0;
+    }
+    return on != 0;
+}
+
+void net_human_commands(uintptr_t ch)
+{
+    if (!g_enemy_ready || g_role == NET_OFF || !net_human_cmds_on() || net_guest_roaming())
+        return;
+    int lead = int(g_lead);
+    if (g_shared && g_role == NET_GUEST && lead < 0)
+        return;
+    bool lead_self = g_role == NET_HOST || (g_shared && lead == net_my_slot());
+    int i = enemies_slot_of(ch);
+    if (i < 0 || i >= kEnemySlots)
+        return;
+    uintptr_t cmd = ch + game::kCmd;
+    DWORD now = GetTickCount();
+    if (lead_self) {
+        uint32_t p = game::at<uint32_t>(cmd, 0x2C), r = game::at<uint32_t>(cmd, 0x34), held = game::at<uint32_t>(cmd, 0x30);
+        DWORD since = 0;
+        uint32_t act = p ? emact_running(ch, &since) : 0;
+        int into = since ? int(now - since) : -1;
+        EnterCriticalSection(&g_enemy_lock);
+        HumanCmdState &s = g_hc_out[i];
+        bool first = !s.tick || int(now - s.tick) > 3000;
+        uint32_t was_held = 0;
+        memcpy(&was_held, s.cmd + (0x30 - kHumanCmdFrom), 4);
+        memcpy(s.cmd, reinterpret_cast<void *>(cmd + kHumanCmdFrom), kHumanCmdLen);
+        s.aim = game::at<float>(ch, kAimPitch);
+        s.press |= p;
+        s.release |= r;
+        s.tick = now | 1;
+        if (p) {
+            s.press_act = act;
+            s.press_ms = into < 0 ? 0xFFFF : uint16_t(into > 0xFFFE ? 0xFFFE : into);
+        }
+        LeaveCriticalSection(&g_enemy_lock);
+        if (p | r) {
+            InterlockedExchange(&g_hc_now, 1);
+            if (g_net_wake)
+                SetEvent(g_net_wake);
+        }
+        if (first)
+            logf("net: enemy #%d %s %p: its commands go to the followers (step 12f)", i, enemies_class_of(ch), (void *)ch);
+        if (emact_logging() && (held != was_held || p)) {
+            static volatile LONG lines = 0;
+            if (InterlockedIncrement(&lines) <= 4000) {
+                const float *st = reinterpret_cast<const float *>(cmd + 0x0C);
+                logf("emact: human #%d %p buttons held %08X pressed %08X released %08X, sticks %.2f %.2f %.2f %.2f %.2f, "
+                     "action %08X", i, (void *)ch, held, p, r, st[0], st[1], st[2], st[3], st[4], game::at<uint32_t>(ch, 0x2DD4));
+            }
+        }
+        return;
+    }
+    EnterCriticalSection(&g_enemy_lock);
+    Follow &f = g_follow[i];
+    int hs = f.host_slot;
+    bool ok = f.ptr == ch && hs >= 0 && hs < kEnemySlots && f.paired_to == hs + 1 && g_hc_in[hs].tick &&
+              int(now - g_hc_in[hs].tick) < 500;
+    HumanCmdState s = {};
+    DWORD key = f.first_seen ^ (DWORD(hs) << 24);
+    if (ok)
+        s = g_hc_in[hs];
+    LeaveCriticalSection(&g_enemy_lock);
+    if (!ok)
+        return;
+    if (s.press || s.release) {
+        EnterCriticalSection(&g_enemy_lock);
+        g_hc_in[hs].press &= ~s.press;
+        g_hc_in[hs].release &= ~s.release;
+        LeaveCriticalSection(&g_enemy_lock);
+    }
+    memcpy(reinterpret_cast<void *>(cmd + kHumanCmdFrom), s.cmd, kHumanCmdLen);
+    game::at<uint32_t>(cmd, 0x2C) = s.press;
+    game::at<uint32_t>(cmd, 0x34) = s.release;
+    human_fix_blow(ch, i, hs, now);
+    if (s.aim == s.aim && std::fabs(s.aim) < 1.6f)
+        game::at<float>(ch, kAimPitch) = s.aim;
+    InterlockedIncrement(&g_hc_applied);
+    if (s.press)
+        InterlockedIncrement(&g_hc_presses);
+    static DWORD said[kEnemySlots] = {};
+    if (said[i] != key) {
+        said[i] = key;
+        logf("net: enemy #%d %s %p takes its leader's #%d's commands (its own AI's are written over, step 12f)", i,
+             enemies_class_of(ch), (void *)ch, hs);
+    }
+    if (emact_logging() && s.press) {
+        static volatile LONG lines = 0;
+        if (InterlockedIncrement(&lines) <= 4000)
+            logf("emact: human #%d %p gets its leader's #%d's presses %08X (held %08X), action %08X; %d ms after they came "
+                 "(its leader pressed %u ms into %08X)", i, (void *)ch, hs, s.press,
+                 *reinterpret_cast<const uint32_t *>(s.cmd + (0x30 - kHumanCmdFrom)), game::at<uint32_t>(ch, 0x2DD4),
+                 s.press_rx ? int(now - s.press_rx) : -1, unsigned(s.press_ms), unsigned(s.press_act));
+    }
+}
+
 uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
 {
     uintptr_t pending_death = 0;
@@ -4002,7 +4272,7 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         s.lot_part = slot.lot_part;
         s.attached = slot.attached ? 1 : 0;
         s.act = 0xFFFFFFFF;
-        if (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && emact_host_ai_humans())) {
+        if (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && (emact_host_ai_humans() || net_human_cmds_on()))) {
             s.act = game::at<uint32_t>(em, 0x2DD4);
             s.act_starts = uint8_t(emact_starts(em));
             ActParams ap = {};
@@ -4434,7 +4704,8 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         }
     } else if (!f.dead_since) {
         f.dead_since = now;
-    } else if (now - f.dead_since > (emact_host_ai() && slot.kind == 0 ? 100u : 1500u)) {
+    } else if (now - f.dead_since > (emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && net_human_cmds_on()))
+                                         ? 100u : 1500u)) {
         f.forced = true;
         f.dead_since = 0;
         f.force_tries = 1;
@@ -4443,7 +4714,8 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         if (hp)
             hp[0] = 0.f;
         pending_death = em;
-        logf("net: enemy #%d %s: dead on the host, no local killing blow in 1.5 s, death forced", i, slot.name);
+        logf("net: enemy #%d %s: dead on the host, no local killing blow in %s, death forced", i, slot.name,
+             emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && net_human_cmds_on())) ? "100 ms" : "1.5 s");
     }
     LeaveCriticalSection(&g_enemy_lock);
     return pending_death;

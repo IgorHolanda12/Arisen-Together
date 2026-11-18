@@ -44,6 +44,8 @@ Arisen Together starts earlier, from how the game spawns monsters:
 - **One brain per monster.** The host's game decides what each monster does. The other games play the same action,
   on the same target, with the same jump points and the same grabs, about 10 ms after the host's game on top of the
   connection's delay. Their own monster AI still runs for everything the action needs, but no longer decides.
+- **Human foes too.** Bandits decide like a pawn, through buttons and sticks: the host's game sends what their AI
+  pressed and the other games press the same, and a blow, a skill or a death that did not follow is started directly.
 - **Places in world coordinates.** The game counts places from the map tile its own player is in; Arisen Together
   converts every place once, so players far apart still see monsters where they really are.
 
