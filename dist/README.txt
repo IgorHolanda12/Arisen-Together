@@ -1,13 +1,13 @@
-Arisen Together 0.13.0 (alpha) - online co-op for Dragon's Dogma: Dark Arisen (Steam or GOG, 2 to 4 players)
+Arisen Together 0.14.0 (alpha) - online co-op for Dragon's Dogma: Dark Arisen (Steam or GOG, 2 to 4 players)
 ===============================================================================================================
 
 Each player needs the game (Steam or GOG, current version) on their own PC, and this same mod
-version (0.13.0).
+version (0.14.0).
 - Steam: guests must be Steam friends with the host. No IP address or port to set.
 - GOG: players join by IP address (direct IP, UDP port 27101). See "GOG and direct IP" below.
 
-Arisen Together does not play with DDDA Coop, nor with its own 0.12.0: every player needs
-Arisen Together 0.13.0. With "Update automatically" on (Settings), the launcher installs it by itself.
+Arisen Together does not play with DDDA Coop, nor with its own earlier versions: every player needs
+Arisen Together 0.14.0. With "Update automatically" on (Settings), the launcher installs it by itself.
 
 Files: ArisenTogether.exe (the launcher), dinput8.dll (the mod), coop.ini (settings). Keep them
 together, in a folder of their own, not the game folder (the launcher copies what the game needs).
@@ -64,6 +64,24 @@ Good to know
 - If the game folder already has another dinput8.dll (another mod), it is not replaced: remove it first.
   A DDDA Coop dinput8.dll is replaced.
 - The exported log holds your Steam name and Steam ID and your friends': send it only to people you trust.
+
+Arisen Together 0.14.0
+----------------------
+Fixes, most of them found by a full review of the code:
+- Open world: the host now sees each guest where they really are. Before, the host's game put a
+  guest's character far away, out of sight.
+- Crates and barrels stay the same on every screen after a player walks into another part of the
+  open world, and when many move at once (a stack knocked over), all of them follow, not only 16.
+  The small stutters while the mod looked for moved objects are gone.
+- A player caught by a monster (an ogre's grab) is no longer shown near the middle of the map after
+  a few area changes.
+- With a host whose game does not decide the monsters (GOG, or Steam with host_ai=0 in coop.ini),
+  the guests' monsters keep their own AI instead of missing their attacks, jumps and grabs.
+- GOG: removing a monster only one game had, and a few big monsters' deaths, no longer use Steam
+  addresses (they could crash the GOG game). GOG is still untested.
+- Launcher: a guest playing by address is told to enter the host's address before the game starts
+  (before, the game waited 90 s for nobody). The buttons no longer flicker under the pointer.
+- Not compatible with 0.13.0 (the network format changed).
 
 Arisen Together 0.13.0
 ----------------------

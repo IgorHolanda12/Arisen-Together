@@ -107,6 +107,7 @@ const char *emact_act_class(uintptr_t ch, uint32_t n);
 bool emact_logging();
 uint32_t emact_starts(uintptr_t ch);
 uint32_t emact_running(uintptr_t ch, DWORD *since);
+bool emact_own_start(uintptr_t ch, uint32_t act, DWORD ms);
 void emact_drive(uintptr_t ch, bool on, int slot);
 void enemy_net_before_action(int slot, uintptr_t ch);
 void net_human_commands(uintptr_t ch);

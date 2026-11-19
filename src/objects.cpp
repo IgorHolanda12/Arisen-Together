@@ -13,6 +13,7 @@ struct Track {
     uint32_t cls;
     float home[3];
     float last[3];
+    float rot[4];
     float applied[3];
     bool has_applied;
     DWORD moved;
@@ -77,78 +78,120 @@ int objects_collect(ObjState *out, int cap)
     int32_t here = net_my_stage();
     float ox = 0.f, oz = 0.f;
     bool known = field_origin(ox, oz);
-    static float last_ox = 0.f, last_oz = 0.f;
-    EnterCriticalSection(&g_lock);
-    if (here != stage || ox != last_ox || oz != last_oz) {
-        stage = here;
-        last_ox = ox;
-        last_oz = oz;
-        g_ntracks = 0;
-    }
-    if (here == 100 && !known) {
-        LeaveCriticalSection(&g_lock);
+    if (here == 100 && !known)
         return 0;
-    }
     float me[3] = {1e9f, 1e9f, 1e9f};
     if (uintptr_t a = possess_arisen())
         mem_safe_read(a + 0x40, me, sizeof me);
+    struct Seen {
+        uintptr_t ptr, vt;
+        uint32_t cls;
+        float pos[3], rot[4];
+    };
+    static Seen seen[kTracks];
+    int ns = 0;
     units_each_unit([&](uintptr_t u) {
+        if (ns >= kTracks)
+            return false;
         uint8_t head[0x60];
         if (!mem_safe_read(u, head, sizeof head))
             return true;
-        uintptr_t vt;
-        memcpy(&vt, head, 4);
-        uint32_t cls = obj_class(u, vt);
-        if (!cls)
+        Seen &e = seen[ns];
+        memcpy(&e.vt, head, 4);
+        e.cls = obj_class(u, e.vt);
+        if (!e.cls)
             return true;
-        float pos[3], rot[4];
-        memcpy(pos, head + 0x40, 12);
-        memcpy(rot, head + 0x50, 16);
-        if (pos[0] != pos[0] || std::fabs(pos[0]) > 1e6f)
+        memcpy(e.pos, head + 0x40, 12);
+        memcpy(e.rot, head + 0x50, 16);
+        if (e.pos[0] != e.pos[0] || std::fabs(e.pos[0]) > 1e6f)
             return true;
-        Track *t = nullptr;
-        for (int k = 0; k < g_ntracks && !t; ++k)
-            if (g_tracks[k].ptr == u && g_tracks[k].vt == vt)
-                t = &g_tracks[k];
-        if (!t) {
-            if (g_ntracks >= kTracks)
-                return true;
-            t = &g_tracks[g_ntracks++];
-            *t = {};
-            t->ptr = u;
-            t->vt = vt;
-            t->cls = cls;
-            memcpy(t->home, pos, 12);
-            field_to_world(t->home);
-            memcpy(t->last, pos, 12);
-        }
-        t->seen = now;
-        if (dist2(pos, t->last) > 2.f * 2.f && (!t->has_applied || dist2(pos, t->applied) > 5.f * 5.f) &&
-            dist2(pos, me) < 1500.f * 1500.f)
-            t->moved = now | 1;
-        memcpy(t->last, pos, 12);
-        if (t->moved && now - t->moved < 2000 && n < cap) {
-            ObjState &s = out[n++];
-            s.cls = cls;
-            memcpy(s.home, t->home, 12);
-            memcpy(s.pos, pos, 12);
-            field_to_world(s.pos);
-            memcpy(s.rot, rot, 16);
-        }
+        e.ptr = u;
+        ++ns;
         return true;
     });
+    static float last_ox = 0.f, last_oz = 0.f;
+    static int cursor = 0;
+    static bool fresh[kTracks];
+    EnterCriticalSection(&g_lock);
+    if (here != stage) {
+        stage = here;
+        g_ntracks = 0;
+    } else if (ox != last_ox || oz != last_oz) {
+        float dx = ox - last_ox, dz = oz - last_oz;
+        for (int k = 0; k < g_ntracks; ++k) {
+            Track &t = g_tracks[k];
+            t.last[0] += dx, t.last[2] += dz;
+            t.applied[0] += dx, t.applied[2] += dz;
+        }
+    }
+    last_ox = ox;
+    last_oz = oz;
+    memset(fresh, 0, sizeof fresh);
+    int hint = 0;
+    for (int j = 0; j < ns; ++j) {
+        const Seen &e = seen[j];
+        int ti = hint < g_ntracks && g_tracks[hint].ptr == e.ptr && g_tracks[hint].vt == e.vt ? hint : -1;
+        for (int k = 0; k < g_ntracks && ti < 0; ++k)
+            if (g_tracks[k].ptr == e.ptr && g_tracks[k].vt == e.vt)
+                ti = k;
+        if (ti < 0) {
+            if (g_ntracks >= kTracks)
+                continue;
+            ti = g_ntracks++;
+            Track &t = g_tracks[ti];
+            t = {};
+            t.ptr = e.ptr;
+            t.vt = e.vt;
+            t.cls = e.cls;
+            memcpy(t.home, e.pos, 12);
+            t.home[0] -= ox, t.home[2] -= oz;
+            memcpy(t.last, e.pos, 12);
+        }
+        hint = ti + 1;
+        Track &t = g_tracks[ti];
+        t.seen = now;
+        float d2 = dist2(e.pos, t.last);
+        bool jump = d2 > 3000.f * 3000.f;
+        if (!jump && d2 > 2.f * 2.f && (!t.has_applied || dist2(e.pos, t.applied) > 5.f * 5.f) &&
+            dist2(e.pos, me) < 1500.f * 1500.f)
+            t.moved = now | 1;
+        memcpy(t.last, e.pos, 12);
+        memcpy(t.rot, e.rot, 16);
+        fresh[ti] = !jump;
+    }
     int w = 0;
     for (int k = 0; k < g_ntracks; ++k)
-        if (now - g_tracks[k].seen < 1000)
+        if (now - g_tracks[k].seen < 1000) {
+            fresh[w] = fresh[k];
             g_tracks[w++] = g_tracks[k];
+        }
     g_ntracks = w;
+    static int cand[kTracks];
+    int m = 0;
+    for (int k = 0; k < g_ntracks; ++k)
+        if (fresh[k] && g_tracks[k].moved && now - g_tracks[k].moved < 2000)
+            cand[m++] = k;
+    if (cursor >= m)
+        cursor = 0;
+    for (int j = 0; j < m && n < cap; ++j) {
+        const Track &t = g_tracks[cand[m > cap ? (cursor + j) % m : j]];
+        ObjState &s = out[n++];
+        s.cls = t.cls;
+        memcpy(s.home, t.home, 12);
+        memcpy(s.pos, t.last, 12);
+        s.pos[0] -= ox, s.pos[2] -= oz;
+        memcpy(s.rot, t.rot, 16);
+    }
+    cursor = m > cap ? (cursor + n) % m : 0;
     static DWORD next_log = 0;
-    static int sent = 0;
+    static int sent = 0, most = 0;
     sent += n;
+    most = m > most ? m : most;
     if (!next_log || int(now - next_log) >= 0) {
         next_log = (now + 10000) | 1;
-        logf("objects: %d tracked in stage %d, %d states sent in 10 s", g_ntracks, int(stage), sent);
-        sent = 0;
+        logf("objects: %d tracked in stage %d, %d states sent in 10 s (at most %d moving at once)", g_ntracks, int(stage),
+             sent, most);
+        sent = most = 0;
     }
     LeaveCriticalSection(&g_lock);
     return n;
@@ -240,6 +283,22 @@ void objects_debug(const char *what, float dx, float dz)
             bd = d;
             best = &g_tracks[k];
         }
+    }
+    if (strcmp(what, "pushall") == 0) {
+        int pushed = 0;
+        for (int k = 0; k < g_ntracks; ++k) {
+            Track &t = g_tracks[k];
+            uintptr_t vt = 0;
+            if (dist2(t.last, me) >= 1500.f * 1500.f || !mem_safe_read(t.ptr, &vt, 4) || vt != t.vt)
+                continue;
+            float *p = reinterpret_cast<float *>(t.ptr + 0x40);
+            logf("objects: push %08X class %08X home (%.0f, %.0f, %.0f) from (%.1f, %.1f, %.1f) by (%.0f, %.0f)",
+                 unsigned(t.ptr), t.cls, t.home[0], t.home[1], t.home[2], p[0], p[1], p[2], dx, dz);
+            p[0] += dx;
+            p[2] += dz;
+            ++pushed;
+        }
+        logf("objects: pushall moved %d objects", pushed);
     }
     if (strcmp(what, "push") == 0 && best) {
         uintptr_t vt = 0;

@@ -1132,6 +1132,14 @@ void on_launch()
         ask(tr(L"Le jeu est déjà lancé. Quitte-le d'abord : les réglages ne s'appliquent qu'au démarrage."), MB_ICONINFORMATION);
         return;
     }
+    if (guest_role() && lan_mode()) {
+        std::string ip;
+        int port = 0;
+        if (!g_code_edit || !parse_address(window_text(g_code_edit), ip, port)) {
+            ask(tr(L"Entre d'abord l'adresse de ton hôte dans le Salon (par exemple 192.168.1.20)."), MB_ICONINFORMATION);
+            return;
+        }
+    }
     int accounts = 0;
     std::wstring backup = backup_saves(&accounts);
     if (backup.empty() &&
@@ -2150,6 +2158,29 @@ void draw_button(const DRAWITEMSTRUCT *d)
     SelectObject(dc, old);
 }
 
+void draw_button_buffered(const DRAWITEMSTRUCT *d)
+{
+    RECT r = d->rcItem;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    HDC mem = w > 0 && h > 0 ? CreateCompatibleDC(d->hDC) : nullptr;
+    HBITMAP bmp = mem ? CreateCompatibleBitmap(d->hDC, w, h) : nullptr;
+    if (!bmp) {
+        if (mem)
+            DeleteDC(mem);
+        draw_button(d);
+        return;
+    }
+    HGDIOBJ old = SelectObject(mem, bmp);
+    DRAWITEMSTRUCT b = *d;
+    b.hDC = mem;
+    OffsetRect(&b.rcItem, -r.left, -r.top);
+    draw_button(&b);
+    BitBlt(d->hDC, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
 HWND make(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id, HFONT font = nullptr)
 {
     bool push = wcscmp(cls, L"BUTTON") == 0 && ((style & 0xF) == BS_PUSHBUTTON || (style & 0xF) == BS_DEFPUSHBUTTON);
@@ -2597,7 +2628,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             return TRUE;
         }
         if (reinterpret_cast<const DRAWITEMSTRUCT *>(l)->CtlType == ODT_BUTTON) {
-            draw_button(reinterpret_cast<const DRAWITEMSTRUCT *>(l));
+            draw_button_buffered(reinterpret_cast<const DRAWITEMSTRUCT *>(l));
             return TRUE;
         }
         break;

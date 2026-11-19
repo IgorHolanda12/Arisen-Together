@@ -92,6 +92,10 @@ struct Unit {
     uint32_t starts;
     DWORD last_start;
     DWORD started;
+    uint32_t own_act;
+    DWORD own_at;
+    uint32_t mod_req;
+    bool mod_req_set;
     bool ours;
     bool driven;
     int follow;
@@ -149,6 +153,15 @@ uint32_t emact_starts(uintptr_t ch)
     UnitsLock lock;
     Unit *u = unit_of(ch, false);
     return u ? u->starts : 0;
+}
+
+bool emact_own_start(uintptr_t ch, uint32_t act, DWORD ms)
+{
+    if (game::at<uint32_t>(ch, 0x2DD4) != act)
+        return false;
+    UnitsLock lock;
+    Unit *u = unit_of(ch, false);
+    return u && u->own_at && u->own_at == u->started && u->own_act == act && int(GetTickCount() - u->own_at) < int(ms);
 }
 
 uint32_t emact_running(uintptr_t ch, DWORD *since)
@@ -215,8 +228,10 @@ void emact_request(uintptr_t ch, uint32_t n)
 {
     {
         UnitsLock lock;
-        if (Unit *u = unit_of(ch, false))
+        if (Unit *u = unit_of(ch, false)) {
             u->ours_pending = true;
+            u->mod_req = n, u->mod_req_set = true;
+        }
     }
     if (is_human(ch)) {
         using Set_t = void(__thiscall *)(uintptr_t, uint32_t);
@@ -273,8 +288,10 @@ void emact_request_ex(uintptr_t ch, uint32_t n, const uint32_t p[16])
 {
     {
         UnitsLock lock;
-        if (Unit *u = unit_of(ch, false))
+        if (Unit *u = unit_of(ch, false)) {
             u->ours_pending = true;
+            u->mod_req = n, u->mod_req_set = true;
+        }
     }
     if (is_human(ch)) {
         using SetEx_t = void(__thiscall *)(uintptr_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -469,6 +486,11 @@ extern "C" void __cdecl emact_before(uintptr_t mgr)
             ++u->starts;
             u->started = now | 1;
             again = req == cur;
+            if (!(u->mod_req_set && u->mod_req == req)) {
+                u->own_act = req;
+                u->own_at = u->started;
+            }
+            u->mod_req_set = false;
             u->gv = u->grab_victim && int(now - u->grab_at) < 200 ? u->grab_victim : 0;
             u->gd = u->gv ? u->grab_dti : 0;
             u->grab_victim = 0;

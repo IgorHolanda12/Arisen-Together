@@ -141,6 +141,55 @@ bool live_readable(const void *p, size_t n)
     return a + n <= hi;
 }
 
+namespace {
+bool strict_in_exe(uintptr_t a) { return a >= 0x00401000 && a < 0x01A00000; }
+bool safe_read(uintptr_t a, void *out, size_t n)
+{
+    SIZE_T got = 0;
+    return a >= 0x10000 && a + n > a &&
+           ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(a), out, n, &got) && got == n;
+}
+uintptr_t safe_u32(uintptr_t a, bool &ok)
+{
+    uintptr_t v = 0;
+    ok = safe_read(a, &v, 4);
+    return v;
+}
+const char *strict_class_of(uintptr_t q)
+{
+    bool ok;
+    if (q < 0x10000 || q >= 0x7FFF0000 || (q & 3))
+        return nullptr;
+    uintptr_t vt = safe_u32(q, ok);
+    if (!ok || !strict_in_exe(vt))
+        return nullptr;
+    uintptr_t fnp = safe_u32(vt + 16, ok);
+    uint8_t fn[6];
+    if (!ok || !strict_in_exe(fnp) || !safe_read(fnp, fn, 6) || fn[0] != 0xB8 || fn[5] != 0xC3)
+        return nullptr;
+    uintptr_t dti;
+    memcpy(&dti, fn + 1, 4);
+    uintptr_t nm = strict_in_exe(dti) ? safe_u32(dti + 4, ok) : 0;
+    return ok && strict_in_exe(nm) ? reinterpret_cast<const char *>(nm) : nullptr;
+}
+
+uintptr_t game_manager(uintptr_t steam_global, const char *cls)
+{
+    bool ok;
+    uintptr_t g = game::va(steam_global), m = safe_u32(g, ok);
+    if (!ok || !m)
+        return 0;
+    const char *c = strict_class_of(m);
+    if (c && strcmp(c, cls) == 0)
+        return m;
+    static volatile LONG said = 0;
+    if (InterlockedIncrement(&said) <= 3)
+        logf("enemies: [%08X] (%s build) holds %s, not the %s: not used", unsigned(g), game::build_name(),
+             c ? c : "no class", cls);
+    return 0;
+}
+}
+
 bool game_origin(float &ox, float &oz);
 
 volatile uintptr_t g_wmap = 0, g_wmap_vt = 0;
@@ -181,54 +230,43 @@ void field_origin_pass()
     static uintptr_t rejected[64] = {};
     static int n_rejected = 0;
     uintptr_t lo = game::build() == game::BUILD_GOG ? 0x01840000 : 0x01860000;
-    for (uintptr_t g = lo; g < lo + 0x30000; g += 4) {
-        if ((g & 0xFFF) == 0 && !mem_readable(reinterpret_cast<void *>(g), 0x1000)) {
-            g += 0x1000 - 4;
+    static uintptr_t page[0x400];
+    for (uintptr_t pg = lo; pg < lo + 0x30000; pg += 0x1000) {
+        if (!safe_read(pg, page, sizeof page))
             continue;
-        }
-        uintptr_t q = game::at<uintptr_t>(g, 0);
-        if (q < 0x10000 || q >= 0x7FFF0000 || (q & 3) || !mem_readable(reinterpret_cast<void *>(q), 4))
-            continue;
-        uintptr_t vt = game::at<uintptr_t>(q, 0);
-        if (vt < 0x00401000 || vt >= 0x01A00000)
-            continue;
-        if (g_wmap_vt) {
-            if (vt == g_wmap_vt && live_readable(reinterpret_cast<void *>(q), game::kFieldOriginPos + 12)) {
-                g_wmap = q;
-                logf("field: cell origin in uWaterReflectionMap %08X (global %08X)", unsigned(q), unsigned(g));
-                return;
+        for (int w = 0; w < 0x400; ++w) {
+            uintptr_t g = pg + uintptr_t(w) * 4, q = page[w];
+            bool ok = false;
+            uintptr_t vt = q >= 0x10000 && q < 0x7FFF0000 && !(q & 3) ? safe_u32(q, ok) : 0;
+            if (!ok || !strict_in_exe(vt))
+                continue;
+            if (g_wmap_vt) {
+                if (vt == g_wmap_vt && live_readable(reinterpret_cast<void *>(q), game::kFieldOriginPos + 12)) {
+                    g_wmap = q;
+                    logf("field: cell origin in uWaterReflectionMap %08X (global %08X)", unsigned(q), unsigned(g));
+                    return;
+                }
+                continue;
             }
-            continue;
+            bool seen = false;
+            for (int k = 0; k < n_rejected && !seen; ++k)
+                seen = rejected[k] == vt;
+            if (seen)
+                continue;
+            const char *c = strict_class_of(q);
+            if (c && strcmp(c, "uWaterReflectionMap") == 0) {
+                if (live_readable(reinterpret_cast<void *>(q), game::kFieldOriginPos + 12)) {
+                    g_wmap_vt = vt;
+                    g_wmap = q;
+                    logf("field: cell origin in uWaterReflectionMap %08X (global %08X, vtable %08X)", unsigned(q),
+                         unsigned(g), unsigned(vt));
+                    return;
+                }
+                continue;
+            }
+            if (n_rejected < 64)
+                rejected[n_rejected++] = vt;
         }
-        bool seen = false;
-        for (int k = 0; k < n_rejected && !seen; ++k)
-            seen = rejected[k] == vt;
-        if (seen)
-            continue;
-        auto in_exe = [](uintptr_t a) { return a >= 0x00401000 && a < 0x01A00000; };
-        uintptr_t fnp = mem_readable(reinterpret_cast<void *>(vt + 16), 4) ? game::at<uintptr_t>(vt, 16) : 0;
-        if (!in_exe(fnp) || !mem_readable(reinterpret_cast<void *>(fnp), 6))
-            goto reject;
-        {
-            auto fn = reinterpret_cast<const uint8_t *>(fnp);
-            uintptr_t dti = 0, name = 0;
-            if (fn[0] == 0xB8 && fn[5] == 0xC3)
-                memcpy(&dti, fn + 1, 4);
-            if (in_exe(dti) && mem_readable(reinterpret_cast<void *>(dti + 4), 4))
-                name = game::at<uintptr_t>(dti, 4);
-            if (!in_exe(name) || !mem_readable(reinterpret_cast<void *>(name), 20)
-                || memcmp(reinterpret_cast<const char *>(name), "uWaterReflectionMap", 20) != 0)
-                goto reject;
-        }
-        if (live_readable(reinterpret_cast<void *>(q), game::kFieldOriginPos + 12)) {
-            g_wmap_vt = vt;
-            g_wmap = q;
-            logf("field: cell origin in uWaterReflectionMap %08X (global %08X, vtable %08X)", unsigned(q), unsigned(g), unsigned(vt));
-            return;
-        }
-    reject:
-        if (n_rejected < 64)
-            rejected[n_rejected++] = vt;
     }
 }
 
@@ -690,7 +728,7 @@ void enemies_on_finalize(uintptr_t em)
     }
     uint32_t group = remove == REMOVE_DEATH && i < kMax && lot_placed(g_slots[i]) ? (g_slots[i].lot_key >> 10) & 0x1FF : 0x1FF;
     LeaveCriticalSection(&g_lock);
-    uintptr_t sm = group != 0x1FF ? game::at<uintptr_t>(0x018FA504, 0) : 0;
+    uintptr_t sm = group != 0x1FF ? game_manager(0x018FA504, "sSetManager") : 0;
     uint32_t rec[2] = {};
     if (sm) {
         rec[0] = game::at<uint32_t>(sm, 0x18A98 + group * 16);
@@ -709,8 +747,9 @@ void enemies_on_finalize(uintptr_t em)
 
 void enemies_request_delete(uintptr_t em, int kind)
 {
-    uintptr_t mgr = game::at<uintptr_t>(kind == ENEMY_HUMAN ? 0x018FA4C8 : 0x018FA4B0, 0);
-    if (!mgr || !em || !readable(reinterpret_cast<void *>(mgr), 4))
+    uintptr_t mgr = kind == ENEMY_HUMAN ? game_manager(0x018FA4C8, "sHumanEnemyManager")
+                                        : game_manager(0x018FA4B0, "sEnemyManager");
+    if (!mgr || !em)
         return;
     using Del_t = void(__thiscall *)(uintptr_t, uintptr_t);
     reinterpret_cast<Del_t>(game::at<uintptr_t>(game::at<uintptr_t>(mgr, 0), 0x30))(mgr, em);
@@ -1522,36 +1561,6 @@ int enemies_snapshot(EnemySlot *out, int cap)
 const char *enemies_class_of(uintptr_t obj) { return class_of(obj); }
 
 namespace {
-bool strict_in_exe(uintptr_t a) { return a >= 0x00401000 && a < 0x01A00000; }
-bool safe_read(uintptr_t a, void *out, size_t n)
-{
-    SIZE_T got = 0;
-    return a >= 0x10000 && a + n > a &&
-           ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(a), out, n, &got) && got == n;
-}
-uintptr_t safe_u32(uintptr_t a, bool &ok)
-{
-    uintptr_t v = 0;
-    ok = safe_read(a, &v, 4);
-    return v;
-}
-const char *strict_class_of(uintptr_t q)
-{
-    bool ok;
-    if (q < 0x10000 || q >= 0x7FFF0000 || (q & 3))
-        return nullptr;
-    uintptr_t vt = safe_u32(q, ok);
-    if (!ok || !strict_in_exe(vt))
-        return nullptr;
-    uintptr_t fnp = safe_u32(vt + 16, ok);
-    uint8_t fn[6];
-    if (!ok || !strict_in_exe(fnp) || !safe_read(fnp, fn, 6) || fn[0] != 0xB8 || fn[5] != 0xC3)
-        return nullptr;
-    uintptr_t dti;
-    memcpy(&dti, fn + 1, 4);
-    uintptr_t nm = strict_in_exe(dti) ? safe_u32(dti + 4, ok) : 0;
-    return ok && strict_in_exe(nm) ? reinterpret_cast<const char *>(nm) : nullptr;
-}
 volatile uintptr_t g_setman = 0, g_setman_vt = 0, g_unit_vt = 0;
 volatile uintptr_t g_units = 0;
 volatile int g_unit_count = 0;

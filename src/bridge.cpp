@@ -520,8 +520,13 @@ void run_line(const char *line)
         strcpy(g_current, "origin");
     } else if (strncmp(line, "stagejump ", 10) == 0) {
         int st = 0, pt = 0;
-        bool ok = sscanf(line + 10, "%d %d", &st, &pt) == 2 && net_stage_jump(st, pt);
-        logf("bridge: stagejump %d %d: %s", st, pt, ok ? "requested" : "refused (not in a stage, or not a plain stage)");
+        int32_t last = -1;
+        DWORD at = stages_last_load(&last);
+        bool there = sscanf(line + 10, "%d %d", &st, &pt) == 2 && at && last == st && int(GetTickCount() - at) < 5000;
+        bool ok = !there && net_stage_jump(st, pt);
+        logf("bridge: stagejump %d %d: %s", st, pt,
+             there ? "skipped (this game loaded that stage less than 5 s ago)"
+             : ok ? "requested" : "refused (not in a stage, or not a plain stage)");
         _snprintf(g_current, sizeof g_current, "stagejump %d %d", st, pt);
     } else if (strncmp(line, "fakehold ", 9) == 0) {
         int s = -1, ms = 0;
@@ -1444,6 +1449,11 @@ void run_line(const char *line)
         if (sscanf(line + 8, "%f %f", &dx, &dz) == 2)
             objects_debug("push", dx, dz);
         _snprintf(g_current, sizeof g_current, "objpush");
+    } else if (strncmp(line, "objpushall ", 11) == 0) {
+        float dx = 0.f, dz = 0.f;
+        if (sscanf(line + 11, "%f %f", &dx, &dz) == 2)
+            objects_debug("pushall", dx, dz);
+        _snprintf(g_current, sizeof g_current, "objpushall");
     } else if (strncmp(line, "objnear", 7) == 0) {
         objects_debug("near", 0.f, 0.f);
         _snprintf(g_current, sizeof g_current, "objnear");

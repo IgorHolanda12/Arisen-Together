@@ -280,7 +280,7 @@ struct SaveNeedMsg {
 };
 #pragma pack(pop)
 
-constexpr uint32_t kMagic = 0x32475441;
+constexpr uint32_t kMagic = 0x33475441;
 constexpr uint32_t kFamily = 0x00475441, kFamilyUpstream = 0x00434444;
 bool other_version(uint32_t magic) { return ((magic & 0x00FFFFFF) == kFamily || (magic & 0x00FFFFFF) == kFamilyUpstream) && magic != kMagic; }
 volatile LONG g_old_peer = 0;
@@ -327,6 +327,7 @@ int g_pawn_order[kPawns] = {1, 2, 0};
 
 bool g_shared = false;
 CharState g_rp[kParty] = {};
+float g_rp_org[kParty][2] = {};
 uint32_t g_rp_press[kParty] = {}, g_rp_release[kParty] = {};
 DWORD g_rp_tick[kParty] = {};
 bool g_rp_away[kParty] = {};
@@ -336,6 +337,7 @@ DWORD g_rp_at[kParty] = {};
 struct RpSample {
     DWORD t;
     float pos[3];
+    float org[2];
 };
 constexpr int kRpSamples = 16;
 RpSample g_rp_hist[kParty][kRpSamples] = {};
@@ -413,7 +415,24 @@ int32_t my_stage()
     return gm && current_stage_area() ? game::at<int32_t>(gm, 0x34) : -1;
 }
 
-void shared_take(int i, const CharState &c, bool here)
+void rp_rebase(int i, float ox, float oz)
+{
+    if (g_rp_org[i][0] != ox || g_rp_org[i][1] != oz) {
+        g_rp[i].pos[0] += g_rp_org[i][0] - ox;
+        g_rp[i].pos[2] += g_rp_org[i][1] - oz;
+        g_rp_org[i][0] = ox, g_rp_org[i][1] = oz;
+    }
+    for (int k = 0; k < g_rp_hist_n[i]; ++k) {
+        RpSample &h = g_rp_hist[i][k];
+        if (h.org[0] != ox || h.org[1] != oz) {
+            h.pos[0] += h.org[0] - ox;
+            h.pos[2] += h.org[1] - oz;
+            h.org[0] = ox, h.org[1] = oz;
+        }
+    }
+}
+
+void shared_take(int i, const CharState &c, bool here, float ox, float oz)
 {
     if (i < 1 || i >= kParty)
         return;
@@ -422,6 +441,8 @@ void shared_take(int i, const CharState &c, bool here)
     memcpy(&r, c.cmd + (0x34 - kCmdCopyFrom), 4);
     EnterCriticalSection(&g_cap_lock);
     DWORD t = GetTickCount();
+    if (c.valid)
+        rp_rebase(i, ox, oz);
     if (c.valid && here) {
         RpSample *h = g_rp_hist[i];
         int &n = g_rp_hist_n[i];
@@ -437,6 +458,7 @@ void shared_take(int i, const CharState &c, bool here)
         }
         h[n].t = t;
         memcpy(h[n].pos, c.pos, sizeof h[n].pos);
+        h[n].org[0] = ox, h[n].org[1] = oz;
         ++n;
         int from = -1;
         for (int k = 0; k < n - 1 && from < 0; ++k)
@@ -468,7 +490,7 @@ void shared_take(int i, const CharState &c, bool here)
     LeaveCriticalSection(&g_cap_lock);
 }
 
-void shared_from_snap(const SnapMsg &m)
+void shared_from_snap(const SnapMsg &m, float ox, float oz)
 {
     int me = m.my_pawn;
     int32_t here = my_stage();
@@ -481,7 +503,7 @@ void shared_from_snap(const SnapMsg &m)
         int local = i == 0 ? 1 + me : i;
         used[local] = true;
         if (m.ch[i].valid)
-            shared_take(local, m.ch[i], here >= 0 && m.stage_of[i] == here);
+            shared_take(local, m.ch[i], here >= 0 && m.stage_of[i] == here, ox, oz);
         else if (i >= 1)
             used[local] = false;
     }
@@ -1451,12 +1473,11 @@ void snap_to_world(SnapMsg &m)
         m.stage.talk_npc[0] += ox, m.stage.talk_npc[2] += oz;
     m.world = 1;
 }
-void snap_to_local(SnapMsg &m)
+void snap_to_local(SnapMsg &m, float &ox, float &oz)
 {
+    enemies_world_origin(ox, oz);
     if (!m.world)
         return;
-    float ox, oz;
-    enemies_world_origin(ox, oz);
     for (CharState &c : m.ch)
         char_shift(c, -ox, -oz);
     if (m.stage.talk_npc[0] != 0.f || m.stage.talk_npc[2] != 0.f)
@@ -1480,23 +1501,34 @@ void capture_state(uintptr_t ch, CharState &s)
     world_pos(ch, s.pos);
     struct Kept {
         uintptr_t ch;
+        DWORD used;
+        bool has;
         float pos[3];
     };
     static Kept kept[8] = {};
+    DWORD now = GetTickCount();
     int slot = -1;
     for (int k = 0; k < 8 && slot < 0; ++k)
         if (kept[k].ch == ch)
             slot = k;
-    if (slot < 0)
-        for (int k = 0; k < 8 && slot < 0; ++k)
-            if (!kept[k].ch)
-                slot = k, kept[k].ch = ch;
+    if (slot < 0) {
+        slot = 0;
+        for (int k = 0; k < 8; ++k)
+            if (!kept[k].ch || int(kept[k].used - kept[slot].used) < 0) {
+                slot = k;
+                if (!kept[k].ch)
+                    break;
+            }
+        kept[slot] = {ch, now, false, {}};
+    }
+    kept[slot].used = now;
     s.monster_held = monster_caught(ch);
     if (s.monster_held && std::fabs(s.pos[0]) + std::fabs(s.pos[1]) + std::fabs(s.pos[2]) < 600.f) {
-        if (slot >= 0)
+        if (kept[slot].has)
             memcpy(s.pos, kept[slot].pos, sizeof kept[slot].pos);
-    } else if (slot >= 0) {
+    } else {
         memcpy(kept[slot].pos, s.pos, sizeof kept[slot].pos);
+        kept[slot].has = true;
     }
     memcpy(s.rot, reinterpret_cast<void *>(ch + 0x50), sizeof s.rot);
     s.yaw = game::at<float>(ch, kYawA);
@@ -1773,11 +1805,10 @@ void receive_all()
         } else if (g_role == NET_HOST && h->type == MSG_PSTATE && n == int(sizeof(PStateMsg))) {
             auto m = reinterpret_cast<const PStateMsg *>(buf);
             peer.pstate = m->me;
-            if (m->world) {
-                float ox, oz;
-                enemies_world_origin(ox, oz);
-                char_shift(peer.pstate, -ox, -oz);
-            }
+            float pox, poz;
+            enemies_world_origin(pox, poz);
+            if (m->world)
+                char_shift(peer.pstate, -pox, -poz);
             peer.pstage = m->stage;
             peer.pstate_tick = GetTickCount() | 1;
             peer.exp_total = m->exp_total;
@@ -1789,7 +1820,7 @@ void receive_all()
             if (g_shared)
                 exp_sync_seen(1 + k, m->exp_total);
             if (g_shared && peer.pawn >= 0)
-                shared_take(1 + peer.pawn, m->me, m->stage == my_stage());
+                shared_take(1 + peer.pawn, peer.pstate, m->stage == my_stage(), pox, poz);
         } else if (h->type == MSG_QUEST && n >= int(sizeof(Header) + 15)) {
             auto m = reinterpret_cast<const QuestChunkMsg *>(buf);
             int o = m->origin;
@@ -2162,10 +2193,11 @@ void receive_all()
             LeaveCriticalSection(&g_enemy_lock);
         } else if (g_role == NET_GUEST && h->type == MSG_SNAP && n == sizeof(SnapMsg)) {
             SnapMsg local = *reinterpret_cast<const SnapMsg *>(buf);
-            snap_to_local(local);
+            float sox, soz;
+            snap_to_local(local, sox, soz);
             const SnapMsg *m = &local;
             if (g_shared) {
-                shared_from_snap(*m);
+                shared_from_snap(*m, sox, soz);
                 for (int s = 0; s < 4; ++s)
                     if (s != m->my_slot)
                         exp_sync_seen(s, m->exp_total[s]);
@@ -3418,23 +3450,13 @@ void net_capture(uintptr_t ch, int i)
     if (i == 0) {
         static float last_ox = 0.f, last_oz = 0.f;
         float ox, oz;
-        field_origin(ox, oz);
+        enemies_world_origin(ox, oz);
         EnterCriticalSection(&g_cap_lock);
-        bool moved = ox != last_ox || oz != last_oz;
-        if (!moved)
-            LeaveCriticalSection(&g_cap_lock);
-        if (moved) {
-            float dx = ox - last_ox, dz = oz - last_oz;
-            for (int k = 0; k < kParty; ++k) {
-                g_rp[k].pos[0] += dx;
-                g_rp[k].pos[2] += dz;
-                for (int s = 0; s < g_rp_hist_n[k]; ++s) {
-                    g_rp_hist[k][s].pos[0] += dx;
-                    g_rp_hist[k][s].pos[2] += dz;
-                }
-            }
-            LeaveCriticalSection(&g_cap_lock);
-            logf("net: field cell origin (%.0f, %.0f) -> (%.0f, %.0f)", last_ox, last_oz, ox, oz);
+        for (int k = 0; k < kParty; ++k)
+            rp_rebase(k, ox, oz);
+        LeaveCriticalSection(&g_cap_lock);
+        if (ox != last_ox || oz != last_oz) {
+            logf("net: field cell origin (%.0f, %.0f) -> (%.0f, %.0f)", -last_ox + 0.f, -last_oz + 0.f, -ox + 0.f, -oz + 0.f);
             last_ox = ox;
             last_oz = oz;
         }
@@ -4050,6 +4072,10 @@ void follower_actions(Follow &f, const EnemyState &s, uintptr_t em, int i, DWORD
         if (emact_logging())
             logf("emact: %s #%d (%08X/%u): its leader's reaction %08X to a blow already reacted to here: not started again", name, i,
                  unsigned(f.my_key), unsigned(f.my_id), unsigned(s.act));
+    } else if (!first && emact_own_start(em, s.act, 1500)) {
+        if (emact_logging())
+            logf("emact: %s #%d (%08X/%u): its leader's %08X, already started here by its own game: not started again", name, i,
+                 unsigned(f.my_key), unsigned(f.my_id), unsigned(s.act));
     } else if (have && (ap.has & 1)) {
         emact_request_ex(em, s.act, ap.p);
         ++g_enemy_stats.acted;
@@ -4275,6 +4301,8 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         if (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && (emact_host_ai_humans() || net_human_cmds_on()))) {
             s.act = game::at<uint32_t>(em, 0x2DD4);
             s.act_starts = uint8_t(emact_starts(em));
+            if (emact_host_ai())
+                s.attached |= 4;
             ActParams ap = {};
             ap.slot = uint8_t(i), ap.starts = s.act_starts, ap.act = s.act;
             uintptr_t gv = 0;
@@ -4588,6 +4616,7 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         return pending_death;
     }
     EnemyState s = g_enemy_state[f.host_slot];
+    bool lead_ai = (s.attached & 4) != 0;
     float *pos = reinterpret_cast<float *>(em + 0x40);
     ++g_enemy_stats.applied;
     if (slot.attached) {
@@ -4635,7 +4664,7 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         if (err > 50.f) {
             static const uintptr_t kPlaceCopies[] = {0xA0, 0xE0, 0x1AD0, 0x1AE0, 0x1AF0, 0x1B00, 0x29C0, 0x5DB0};
             bool off_origin = std::fabs(pos[0]) + std::fabs(pos[1]) + std::fabs(pos[2]) > 10.f;
-            if (err > 200.f && !first && off_origin && emact_host_ai() && slot.kind == 0 &&
+            if (err > 200.f && !first && off_origin && emact_host_ai() && lead_ai && slot.kind == 0 &&
                 mem_readable(reinterpret_cast<void *>(em), 0x6000)) {
                 char where[160] = "";
                 int n = 0;
@@ -4666,7 +4695,20 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         game::at<float>(em, kYawC) = s.yaw;
         memcpy(reinterpret_cast<void *>(em + 0x50), s.rot, sizeof s.rot);
     }
-    if (emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && emact_host_ai_humans()))) {
+    bool driven = emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && emact_host_ai_humans()));
+    if (driven && !lead_ai) {
+        static volatile LONG said = 0;
+        if (!InterlockedExchange(&said, 1))
+            logf("net: enemy #%d %s: its leader's game does not decide its units' actions (host_ai off there, or a GOG "
+                 "game): they keep their own AI here (said once)", i, slot.name);
+        if (f.drove || f.held) {
+            emact_drive(em, false, -1);
+            f.drove = false;
+            f.held = 0;
+            f.act_starts = -1;
+        }
+    }
+    if (driven && lead_ai) {
         f.my_key = slot.lot_key, f.my_id = slot.lot_id, f.my_died = slot.died != 0;
         if (f.held) {
             logf("net: enemy #%d %s: its leader's unit is sent again after %lu ms held", i, slot.name, now - f.held);
@@ -4680,6 +4722,7 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         return pending_death;
     float *hp = s.hp_max > 0.f ? enemies_hp(em) : nullptr;
     bool local_dead = slot.died != 0;
+    bool quick_death = lead_ai && emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && net_human_cmds_on()));
     if (!s.died) {
         if (hp && s.hp > 0.f)
             hp[0] = s.hp;
@@ -4704,8 +4747,7 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
         }
     } else if (!f.dead_since) {
         f.dead_since = now;
-    } else if (now - f.dead_since > (emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && net_human_cmds_on()))
-                                         ? 100u : 1500u)) {
+    } else if (now - f.dead_since > (quick_death ? 100u : 1500u)) {
         f.forced = true;
         f.dead_since = 0;
         f.force_tries = 1;
@@ -4715,23 +4757,27 @@ uintptr_t enemy_net_after_finalize(EnemySlot &slot, int i, int *remove)
             hp[0] = 0.f;
         pending_death = em;
         logf("net: enemy #%d %s: dead on the host, no local killing blow in %s, death forced", i, slot.name,
-             emact_host_ai() && (slot.kind == 0 || (slot.kind == ENEMY_HUMAN && net_human_cmds_on())) ? "100 ms" : "1.5 s");
+             quick_death ? "100 ms" : "1.5 s");
     }
     LeaveCriticalSection(&g_enemy_lock);
     return pending_death;
 }
 
-constexpr uintptr_t kStandInDeaths[] = {
-    0x00A298C0,
-    0x0094EE90,
-    0x009A4DC0,
-    0x009B46B0,
-    0x009BD060,
-    0x00A0C5F0,
-    0x00A345F0,
-    0x0097CA10,
-    0x00992D80,
+const char *const kStandInDeaths[] = {
+    "uEm5500TentacleBase", "uEm5500_00", "uEm5500_01", "uEm5500C_00", "uEm5502_00", "uEm5502_01",
+    "uEm0700", "uEm0701", "uEm0702", "uEm0703",
+    "uEm5200", "uEm5201", "uEm5200_00", "uEm5201_00", "uEm5200_01", "uEm5201_01",
+    "uEm5500", "uEm5500B", "uEm5500C", "uEm5502", "uEm5501",
+    "uEm5000", "uEm5001",
+    "uEm5100", "uEm5101",
 };
+static bool stand_in_death(const char *cls)
+{
+    for (const char *n : kStandInDeaths)
+        if (strcmp(cls, n) == 0)
+            return true;
+    return false;
+}
 volatile LONG g_test_death_skip = 0;
 void net_test_death_skip(int n)
 {
@@ -4752,25 +4798,27 @@ void enemy_net_death(uintptr_t em)
     using Death_t = void(__thiscall *)(uintptr_t, uint32_t, uint32_t);
     uintptr_t fn = game::at<uintptr_t>(game::at<uintptr_t>(em, 0), 0x120);
     uint32_t hit = 0;
-    static volatile LONG said[sizeof kStandInDeaths / sizeof kStandInDeaths[0]] = {};
-    for (size_t k = 0; k < sizeof kStandInDeaths / sizeof kStandInDeaths[0]; ++k)
-        if (fn == kStandInDeaths[k]) {
-            alignas(16) static thread_local uint8_t stand_in[0x400];
-            memset(stand_in, 0, sizeof stand_in);
-            hit = uint32_t(reinterpret_cast<uintptr_t>(stand_in));
-            if (!InterlockedExchange(&said[k], 1))
-                logf("net: death of %s %p with a stand-in hit (its death handler %08X needs one; said once per handler)",
-                     enemies_class_of(em), (void *)em, unsigned(fn));
-            break;
-        }
+    const char *cls = enemies_class_of(em);
+    if (stand_in_death(cls)) {
+        alignas(16) static thread_local uint8_t stand_in[0x400];
+        memset(stand_in, 0, sizeof stand_in);
+        hit = uint32_t(reinterpret_cast<uintptr_t>(stand_in));
+        static volatile LONG said = 0;
+        if (InterlockedIncrement(&said) <= 8)
+            logf("net: death of %s %p with a stand-in hit (its death handler %08X needs one)", cls, (void *)em, unsigned(fn));
+    }
     reinterpret_cast<Death_t>(fn)(em, 0, hit);
 }
 
 bool death_retry_ok(uintptr_t em)
 {
-    uintptr_t vt = em ? game::at<uintptr_t>(em, 0) : 0;
-    uintptr_t fn = vt ? game::at<uintptr_t>(vt, 0x120) : 0;
-    return fn != 0x00A471F0 && fn != 0x00A4D450 && fn != 0x00A7D560 && fn != 0x00A81500;
+    static const char *const kDragons[] = {"uEmDragonBase", "uEmZakoDragonBase", "uEm5800", "uEm5801", "uEm5802", "uEm5900",
+                                           "uEm5901", "uEm5902", "uEm5903", "uEm5904", "uEm5905", "uEm5906"};
+    const char *cls = em ? enemies_class_of(em) : "?";
+    for (const char *n : kDragons)
+        if (strcmp(cls, n) == 0)
+            return false;
+    return true;
 }
 
 int enemy_net_follow(int local_slot)
